@@ -2,11 +2,26 @@
 
 **Blackwell-native MoE/LLM inference runtime.** The engineering arm of [SN74 on Gittensor](https://github.com/gittensor-ai-lab) — reproducible, hardware-level inference-speed gains for NVIDIA Blackwell consumer/edge GPUs: RTX Spark (`sm_121`), RTX 5090 & RTX PRO 6000 (`sm_120`), Jetson Thor (`sm_121`).
 
-Unified monorepo for the kernels, MoE engine, runtime, and benchmarks. (The `agent` autotuner and the private `kernel-wiki` live in their own repos.)
-
 ## Proven
 
-Qwen3-30B-A3B (Q4_K_M GGUF) runs end-to-end on an RTX PRO 6000 (sm_120), decode optimized **0.60 → 134 tok/s (≈220×)** across 6 source-verifiable passes — within **1.8×** of llama.cpp on the same model + GPU, output verified correct, **21.7 GB** resident (experts kept quantized).
+Qwen3-30B-A3B (Q4_K_M GGUF) runs end-to-end on an RTX PRO 6000 (sm_120), decode optimized **0.60 → 134 tok/s (≈220×)** across 6 source-verifiable passes, output verified correct, **21.7 GB** resident (experts kept quantized). Independently verified on an **RTX 5090** (CUDA 13): **100% top-1 token agreement** with llama.cpp (KL ≈ 0.14 nats), **163.88 tok/s** — see the [accuracy](bench/results/accuracy_qwen3-30b-a3b_q4km.md) and [RTX 5090](bench/results/qwen3-30b-a3b_q4km_rtx5090.md) results.
+
+## Quickstart
+
+On an NVIDIA Blackwell box (CUDA 12.8+) — the scripts auto-detect your GPU arch, fetch **prebuilt binaries** (or build from source if incompatible), and download the model:
+
+```bash
+# decode throughput (fetches Qwen3-30B-A3B Q4_K_M on first run)
+bench/scripts/bench.sh --download
+
+# head-to-head vs llama.cpp on the same GGUF + GPU
+bench/scripts/bench.sh --download --compare
+
+# accuracy gate — token-match / KL / perplexity vs llama.cpp
+bench/scripts/accuracy.sh --download
+```
+
+Your own model: `bench/scripts/bench.sh /path/to/model.gguf --tokens 256`. All options: [`bench/scripts/README.md`](bench/scripts/README.md).
 
 ## Layout & emission weights
 
@@ -37,4 +52,14 @@ The top-level `CMakeLists.txt` is a superbuild (`kernels → moe → runtime`); 
 
 ## Contributing
 
-Source-required and reproducible — no pre-built binaries. Contributions are rewarded on SN74 by the **verified marginal speedup** they add over the live frontier, correctness-gated against a frozen reference, validated on both basket models (Qwen + Gemma). Full model: the [org profile](https://github.com/gittensor-ai-lab).
+Source-required and reproducible — the validator builds your PR from source (the
+prebuilt binaries are a run convenience, not a submission format). Before a PR, run
+`bench/scripts/bench.sh` (speed) and `bench/scripts/accuracy.sh` (accuracy must hold:
+~100% top-1 + KL ≈ 0 vs the prior build). Contributions are rewarded on SN74 by the
+**verified marginal speedup** added over the live frontier, correctness-gated against a
+frozen reference, validated on both basket models (Qwen + Gemma). See
+[CONTRIBUTING.md](CONTRIBUTING.md) and the [org reward model](https://github.com/gittensor-ai-lab).
+
+## License
+
+[MIT](LICENSE) · [Changelog](CHANGELOG.md)
