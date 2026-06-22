@@ -16,14 +16,27 @@
 | Decode throughput | **163.88 tok/s** (6.1 ms/token, n=128) |
 | Correctness | "What is the capital of France?" → **"The capital of France is Paris."** ✓ |
 
-## Cross-config note — 5090 vs PRO 6000 (not apples-to-apples)
+## vs llama.cpp — same card, same CUDA (apples-to-apples)
 
-The PRO 6000 measured **133–134 tok/s** (`qwen3-30b-a3b_q4km_pro6000.md`); the 5090 here hits **163.88**. The two runs differ in **both the GPU and the toolchain** (5090 / CUDA 13 vs PRO 6000 / CUDA 12.8), so the gap can't be cleanly attributed to one factor. Likely contributors, not yet isolated:
+Built llama.cpp (CUDA, `sm_120`) on the *same* 5090 / CUDA 13 and ran `llama-bench` on the *same* GGUF:
 
-- **Core clock** — decode at bs=1 is latency-bound (vectorizing & norm-fusion both gave ~0), so it's sensitive to SM clock; the consumer RTX 5090 boosts higher than the PRO 6000 Server Edition at the same 1792 GB/s memory bandwidth.
-- **CUDA 13 codegen / driver** — a newer `nvcc` + driver may schedule/emit the kernels better.
+| Engine | decode tg128 | gap |
+|---|--:|--:|
+| llama.cpp (CUDA) | **365.73 ± 2.06 tok/s** | 1.0× |
+| sparkinfer | 163.88 tok/s | **2.23×** |
 
-Isolating it would need the same CUDA toolkit on both cards (or clock-locked runs). Current read: probably a mix, with core clock the likely larger term for latency-bound decode — but the CUDA-version contribution is plausible and untested.
+This is the clean comparison. The earlier **1.8×** figure was on the PRO 6000 (134 vs 240.5); on the consumer 5090 — our flagship target — the gap is **wider: 2.23×**.
+
+### Both engines scale to the 5090 — llama.cpp more
+
+| Engine | PRO 6000 (CUDA 12.8) | RTX 5090 (CUDA 13) | gain |
+|---|--:|--:|--:|
+| sparkinfer | 134 | 163.88 | **+22%** |
+| llama.cpp | 240.5 | 365.73 | **+52%** |
+
+The 5090/CUDA-13 environment is faster for **both** engines (so the speedup is hardware/toolchain, not sparkinfer-specific — this answers the "is it the CUDA version?" question: the newer card + toolkit helps, but it helps *both*). The telling part is that llama.cpp gains **+52%** vs our **+22%**.
+
+**Why:** our bs=1 decode is latency-bound on **launch overhead + ~770 tiny kernels/token** (established in the PRO 6000 profiling). Launch / CPU-side overhead does **not** scale with GPU clock, so a faster card barely helps that fraction — while llama.cpp's fewer, fatter kernels are more on-GPU-compute-bound and ride the clock up. The 5090 data therefore **reinforces the fusion thesis**: collapsing the tiny per-token kernels (fuse QKV, residual+norm, multi-output GEMV) is the lever, and it would also recover the clock-scaling we're currently leaving on the table.
 
 ## Bugs found & fixed during 5090 bring-up
 
