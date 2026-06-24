@@ -1,27 +1,24 @@
 ## Summary
 
-<!-- What this PR optimizes and the core idea — which kernel/path, what changed. -->
+<!-- What this PR adds or changes, and why. One or two lines. -->
 
 
 ## Proof of speedup
 
-<!-- sparkinfer rewards verified speedups only. Show before -> after from a real benchmark run.
-     (Non-speedup PRs — bug fixes, tooling, docs — are welcome too; they score 0, so you can
-     skip this section and say so.) -->
-
 - [ ] Tested on **RTX 5090** (`sm_120`)
 
-**Benchmark log** — `bench/scripts/bench.sh --download` on the baseline build and on this PR:
+<!-- Back any speed/perf claim with a benchmark log (before -> after). A docs-only or
+     non-perf PR can write "N/A". -->
+
+**Benchmark log** (before → after):
 
 ```text
-# paste the bench output here (baseline -> this PR): decode tok/s
+# paste the benchmark output here (baseline -> this PR)
 ```
 
-| build | decode tok/s |
+| | decode tok/s |
 |---|--:|
-| frontier (before) |  |
-| this PR (after)   |  |
+| before |  |
+| after  |  |
 
-<!-- More PR-checklist items will be added here later: correctness / accuracy gate
-     (bench/scripts/accuracy.sh), compute-sanitizer clean, both basket models (Qwen + Gemma).
-     The auto-eval bot also rebuilds + benchmarks this PR on an RTX 5090 and posts an eval:* label. -->
+<!-- More checklist items will be added here later. -->
