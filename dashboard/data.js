@@ -105,6 +105,17 @@ window.SPARKINFER = {
   ],
   "prs": [
     {
+      "num": 14,
+      "title": "fix(kernels/attention): offset flash_prefill causal mask by seqlen_kv - seqlen_q",
+      "areas": [
+        "kernels"
+      ],
+      "label": "none",
+      "tps": 184.71,
+      "delta_pct": null,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/14"
+    },
+    {
       "num": 15,
       "title": "fix(runtime/qwen35): force n_shared=0 on GGUF loads without shared-expert tensors",
       "areas": [
