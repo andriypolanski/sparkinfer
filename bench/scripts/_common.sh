@@ -16,10 +16,15 @@ detect_arch() {
   echo "${ARCH:-${cc:-120}}"
 }
 
+# nvcc 12.8 fails against Ubuntu 24.04's GCC 13.3 libstdc++ (cstdio / __gnu_cxx errors). Pin the
+# CUDA host compiler to g++-12 (a fully supported combo) when it's available.
+CUDA_HOST_FLAG=""
+[ -x /usr/bin/g++-12 ] && CUDA_HOST_FLAG="-DCMAKE_CUDA_HOST_COMPILER=g++-12"
+
 ensure_sparkinfer() {  # $1 = arch
   [ -x "$ROOT/build/runtime/qwen3_gguf_bench" ] && [ -x "$ROOT/build/runtime/qwen3_gguf_score" ] && return
   echo ">> building sparkinfer (sm_$1) ..." >&2
-  cmake -S "$ROOT" -B "$ROOT/build" -DCMAKE_CUDA_ARCHITECTURES="$1" -DCMAKE_BUILD_TYPE=Release >/dev/null
+  cmake -S "$ROOT" -B "$ROOT/build" -DCMAKE_CUDA_ARCHITECTURES="$1" -DCMAKE_BUILD_TYPE=Release $CUDA_HOST_FLAG >/dev/null
   # Cap at 2 parallel jobs — cc1plus for sm_120 uses ~2-3 GB RAM each; -j4 OOMs on 64GB eval boxes.
   cmake --build "$ROOT/build" -j2 >/dev/null
 }
@@ -50,7 +55,7 @@ ensure_llamacpp() {  # $1 = arch ; builds llama-bench + llama-server (one-time, 
   echo ">> building llama.cpp (CUDA sm_$1) — one-time, several minutes ..." >&2
   [ -d "$LLAMACPP_DIR/.git" ] || git clone --depth=1 https://github.com/ggml-org/llama.cpp "$LLAMACPP_DIR" >&2
   cmake -S "$LLAMACPP_DIR" -B "$LLAMACPP_DIR/build" -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="$1" \
-        -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF >/dev/null 2>&1
+        -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF $CUDA_HOST_FLAG >/dev/null 2>&1
   cmake --build "$LLAMACPP_DIR/build" -j4 --target llama-bench llama-server >/dev/null 2>&1
 }
 

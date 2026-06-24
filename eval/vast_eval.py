@@ -249,9 +249,11 @@ def main():
             checkout = f"git fetch -q origin '{args.ref}' && git checkout -q FETCH_HEAD"
         else:
             checkout = f"git fetch -q origin '{args.ref}' 2>/dev/null || true && git checkout -q '{args.ref}'"
+        # g++-12: nvcc 12.8 breaks against Ubuntu 24.04's GCC 13.3 libstdc++ (cstdio /__gnu_cxx
+        # errors). The build pins CMAKE_CUDA_HOST_COMPILER=g++-12, so it must be present.
         setup = ("export DEBIAN_FRONTEND=noninteractive; "
-                 "(command -v git >/dev/null && command -v cmake >/dev/null && dpkg -s libisl23 >/dev/null 2>&1 && dpkg -s python3-pip >/dev/null 2>&1) "
-                 "|| (apt-get update -q && apt-get install -y -q git curl cmake build-essential libisl23 python3-pip); "
+                 "(command -v git >/dev/null && command -v cmake >/dev/null && dpkg -s libisl23 >/dev/null 2>&1 && dpkg -s python3-pip >/dev/null 2>&1 && dpkg -s g++-12 >/dev/null 2>&1) "
+                 "|| (apt-get update -q && apt-get install -y -q git curl cmake build-essential libisl23 python3-pip gcc-12 g++-12); "
                  "python3 -m pip install -q --break-system-packages huggingface_hub 'huggingface-hub[cli]' tokenizers >/dev/null 2>&1 || true; "
                  f"if [ -d /root/sparkinfer/.git ]; then cd /root/sparkinfer && {checkout}; "
                  f"else git clone -q {REPO} /root/sparkinfer && cd /root/sparkinfer && {checkout}; fi")
