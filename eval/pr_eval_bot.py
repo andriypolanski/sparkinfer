@@ -130,19 +130,22 @@ def main():
     dash = load_dash()
     frontier = dash["status"]["frontier_tps"] if dash else args.frontier   # live ledger frontier
     prs = json.loads(gh(["pr", "list", "-R", args.repo, "--state", "open",
-                         "--json", "number,headRefName,headRefOid,title"]).stdout or "[]")
+                         "--json", "number,headRefName,headRefOid,title,isCrossRepository"]).stdout or "[]")
     if not prs:
         print("no open PRs"); return
     for pr in prs:
         num, branch, oid = pr["number"], pr["headRefName"], pr["headRefOid"][:7]
+        # Fork PRs: headRefName is a branch on the contributor's fork, not on origin.
+        # Use pull/N/head so vast_eval.py can fetch it via GitHub's always-present ref.
+        ref = f"pull/{num}/head" if pr.get("isCrossRepository") else branch
         areas = areas_for_pr(args.repo, num)                       # deterministic, cheap, every poll
-        print(f"PR #{num} @ {oid}: areas={sorted(areas) or ['(none)']}")
+        print(f"PR #{num} @ {oid}: areas={sorted(areas) or ['(none)']} ref={ref}")
         if not args.dry_run: apply_area_labels(args.repo, num, areas)
         if oid in evaluated_commits(args.repo, num):
             print(f"PR #{num} @ {oid}: already evaluated — skip eval"); continue
-        print(f"PR #{num} @ {oid}: evaluating '{branch}' ...")
+        print(f"PR #{num} @ {oid}: evaluating '{ref}' ...")
         r = subprocess.run([sys.executable, os.path.join(HERE, "vast_eval.py"),
-                            "--reuse", str(current_instance(args.instance)), "--ref", branch,
+                            "--reuse", str(current_instance(args.instance)), "--ref", ref,
                             "--frontier", str(frontier), "--ceiling", str(args.ceiling)],
                            cwd=ROOT, capture_output=True, text=True, timeout=14400)
         line = next((l for l in r.stdout.splitlines() if l.startswith("RESULT_JSON")), None)

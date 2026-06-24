@@ -167,11 +167,17 @@ def main():
         print(f">> switched to fresh instance {iid} (old {args.reuse} stopped; destroy it if unneeded)")
 
     try:
+        # pull/N/head refs (fork PRs) aren't fetched by default — need explicit fetch + FETCH_HEAD checkout.
+        if args.ref.startswith("pull/") and args.ref.endswith("/head"):
+            checkout = f"git fetch -q origin '{args.ref}' && git checkout -q FETCH_HEAD"
+        else:
+            checkout = f"git fetch -q origin '{args.ref}' 2>/dev/null || true && git checkout -q '{args.ref}'"
         setup = ("export DEBIAN_FRONTEND=noninteractive; "
                  "command -v git >/dev/null || (apt-get update -q && apt-get install -y -q git curl cmake build-essential); "
+                 "dpkg -s libisl23 >/dev/null 2>&1 || (apt-get update -q && apt-get install -y -q libisl23); "
                  "pip install -q --break-system-packages huggingface_hub tokenizers >/dev/null 2>&1 || true; "
-                 f"if [ -d /root/sparkinfer/.git ]; then cd /root/sparkinfer && git fetch -q origin && git checkout -q {args.ref} && git pull -q origin {args.ref}; "
-                 f"else git clone -q {REPO} /root/sparkinfer && cd /root/sparkinfer && git checkout -q {args.ref}; fi")
+                 f"if [ -d /root/sparkinfer/.git ]; then cd /root/sparkinfer && {checkout}; "
+                 f"else git clone -q {REPO} /root/sparkinfer && cd /root/sparkinfer && {checkout}; fi")
         sr = sh(host, port, setup, timeout=1800)
         if sr.returncode:
             print(f">> setup rc={sr.returncode} — stdout/stderr tail (continuing):")
