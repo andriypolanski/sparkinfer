@@ -105,6 +105,17 @@ window.SPARKINFER = {
   ],
   "prs": [
     {
+      "num": 21,
+      "title": "fix(runtime): guard DecodeRunner batch size against scratch overflow",
+      "areas": [
+        "runtime"
+      ],
+      "label": "none",
+      "tps": 186.38,
+      "delta_pct": null,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/21"
+    },
+    {
       "num": 22,
       "title": "fix(moe): validate router inputs before launching top-k kernel",
       "areas": [
