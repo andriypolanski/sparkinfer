@@ -25,6 +25,14 @@ def current_instance(default):
     try: return int(open(INSTANCE_FILE).read().strip())
     except Exception: return default
 
+# Pinned default box: a stable, known-good instance (cached model, good download speed) that we
+# reuse first on every run and NEVER destroy. vast_eval.py is invoked with --pinned for it, so on
+# bring-up failure it retries on later runs (~30 min apart) instead of provisioning immediately;
+# only after VAST_REUSE_MAX_RETRIES misses does it spin up a new box (the pinned one is kept).
+# Set VAST_DEFAULT_INSTANCE="" to disable the pin and always provision fresh.
+PINNED_INSTANCE = os.environ.get("VAST_DEFAULT_INSTANCE", "42613343").strip()
+PINNED_RETRY_RC = 75   # must match vast_eval.PINNED_RETRY_RC
+
 # Subsystem buckets for the deterministic area:<name> label (from a PR's top-level changed
 # dirs — no AI). Categorization/display only: SN74 scoring is speedup-only (the eval:* tier),
 # NOT a per-subsystem budget.
@@ -458,6 +466,11 @@ def main():
         print("--- dry-run: would evaluate (oldest-first): " +
               ", ".join(f"#{n}" for _, n, *_ in pending)); return
 
+    # Reuse the pinned stable box first (cached model, good download speed). Reset the pointer to it
+    # at the start of each run so the pin is always tried before any fallback box left from a prior run.
+    if PINNED_INSTANCE:
+        with open(INSTANCE_FILE, "w") as f: f.write(PINNED_INSTANCE)
+
     # Run all pending evals on the SAME instance: pass --keep so vast_eval.py never stops/destroys
     # the box mid-queue. The bot stops the instance once after ALL PRs finish (or if the instance
     # dies, subsequent PRs self-heal by provisioning a new one).
@@ -467,13 +480,22 @@ def main():
         # the new best — otherwise two PRs could both "beat" the same stale baseline.
         d = load_dash()
         cur_frontier = d["status"]["frontier_tps"] if d else frontier
-        print(f"PR #{num} @ {oid}: evaluating '{ref}' (frontier={cur_frontier}) ...")
-        r = subprocess.run([sys.executable, os.path.join(HERE, "vast_eval.py"),
-                            "--reuse", str(current_instance(args.instance)), "--ref", ref,
-                            "--frontier", str(cur_frontier), "--ceiling", str(args.ceiling),
-                            "--keep"],          # keep instance alive — bot stops it after all PRs
-                           cwd=ROOT, capture_output=True, text=True, timeout=14400)
-        # If vast_eval self-healed to a new instance, track the new id for the next PR.
+        cur_iid = current_instance(args.instance)
+        cmd = [sys.executable, os.path.join(HERE, "vast_eval.py"),
+               "--reuse", str(cur_iid), "--ref", ref,
+               "--frontier", str(cur_frontier), "--ceiling", str(args.ceiling),
+               "--keep"]            # keep instance alive — bot stops it after all PRs
+        if PINNED_INSTANCE and str(cur_iid) == PINNED_INSTANCE:
+            cmd.append("--pinned")  # never destroy the pin; retry-then-fallback on bring-up failure
+        pinned = "--pinned" in cmd
+        print(f"PR #{num} @ {oid}: evaluating '{ref}' (frontier={cur_frontier}) on instance "
+              f"{cur_iid}{' [pinned]' if pinned else ''} ...")
+        r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, timeout=14400)
+        if r.returncode == PINNED_RETRY_RC:
+            tail = next((l for l in reversed((r.stdout + r.stderr).splitlines()) if l.strip()), "")
+            print(f">> {tail}\n>> aborting this run — the next scheduled run (~30 min) retries the "
+                  f"pinned box. No PRs evaluated this tick."); return
+        # If vast_eval self-healed/fell back to a new instance, track the new id for the next PR.
         for l in r.stdout.splitlines():
             if l.startswith("NEW_INSTANCE_ID "):
                 try:

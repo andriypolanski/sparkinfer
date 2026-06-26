@@ -38,6 +38,22 @@ INSTANCE_FILE = os.path.expanduser(os.environ.get("VAST_INSTANCE_FILE", "~/.spar
 _DEFAULT_SKIP = "94.177.17.69,120.238.149.205,192.3.91.246,47.253.144.202,175.121.93.64,180.70.178.129"
 SKIP_HOSTS_PERMANENT = set(filter(None, os.environ.get("VAST_SKIP_HOSTS", _DEFAULT_SKIP).split(",")))
 
+# --pinned: reuse a stable, known-good box (cached model, good download speed) as the default and
+# NEVER destroy it. If it can't be brought up within --reuse-timeout (5 min), don't provision a new
+# box immediately — leave the pinned box intact and exit PINNED_RETRY_RC so the next scheduled run
+# (~30 min later) retries. Only after REUSE_MAX_RETRIES consecutive misses do we provision a fresh
+# box (the pinned one is still kept). Counter persists in REUSE_RETRY_FILE across runs.
+REUSE_RETRY_FILE = os.path.expanduser(os.environ.get("VAST_REUSE_RETRY_FILE", "~/.sparkinfer_reuse_retries"))
+REUSE_MAX_RETRIES = int(os.environ.get("VAST_REUSE_MAX_RETRIES", "2"))
+PINNED_RETRY_RC = 75   # distinct exit code: "pinned box not up; retry on the next run" (not an error)
+def _reuse_retries():
+    try: return int(open(REUSE_RETRY_FILE).read().strip())
+    except Exception: return 0
+def _set_reuse_retries(n):
+    try:
+        with open(REUSE_RETRY_FILE, "w") as f: f.write(str(n))
+    except Exception: pass
+
 def sh(host, port, cmd, timeout=3600):
     try:
         return subprocess.run(
@@ -186,6 +202,7 @@ def main():
     ap.add_argument("--reuse-timeout", type=int, default=300, help="seconds to wait for a reused box before recreating (default 300 = 5 min; a cold start of a stopped cached box can take minutes — destroying it prematurely wastes the 17GB cache)")
     ap.add_argument("--new-timeout", type=int, default=480, help="seconds to wait for a freshly created box (default 480 = 8 min)")
     ap.add_argument("--no-recreate", action="store_true", help="on reuse failure, error out instead of provisioning a new box")
+    ap.add_argument("--pinned", action="store_true", help="the --reuse box is the stable default: NEVER destroy it; on bring-up failure exit PINNED_RETRY_RC for up to REUSE_MAX_RETRIES runs before provisioning a new box (pinned kept)")
     ap.add_argument("--destroy-on-error", action="store_true", help="destroy (not just stop) the instance if the eval produces no result")
     args = ap.parse_args()
 
@@ -199,8 +216,22 @@ def main():
         ep = bring_up(v, iid, args.reuse_timeout)
         if ep:
             host, port = ep
+            if args.pinned: _set_reuse_retries(0)   # pinned box is back up — clear the miss counter
         elif args.no_recreate:
             sys.exit(f"instance {iid} never came up (--no-recreate)")
+        elif args.pinned:
+            # PINNED: never destroy the stable box. Leave it intact and retry on the next run;
+            # only provision a new box after REUSE_MAX_RETRIES consecutive misses.
+            n = _reuse_retries() + 1
+            if n <= REUSE_MAX_RETRIES:
+                _set_reuse_retries(n)
+                print(f">> pinned instance {iid} not SSH-ready within {args.reuse_timeout}s "
+                      f"(miss {n}/{REUSE_MAX_RETRIES}) — leaving it intact; retry on the next run (~30 min).")
+                sys.exit(PINNED_RETRY_RC)
+            _set_reuse_retries(0)
+            print(f">> pinned instance {iid} unavailable after {REUSE_MAX_RETRIES} retries — "
+                  f"provisioning a NEW box (pinned {iid} kept, NOT destroyed).")
+            iid = 0
         else:
             # Destroy the stuck box (can't SSH → no value in keeping disk) and provision a fresh one.
             stuck_host = (info_of(v, iid) or {}).get("public_ipaddr")
