@@ -1,5 +1,5 @@
 {
-  "updated": "2026-06-26",
+  "updated": "2026-06-27",
   "status": {
     "gpu": "RTX 5090 · sm_120 · CUDA 13",
     "model": "Qwen3-30B-A3B · Q4_K_M",
@@ -81,6 +81,19 @@
     }
   ],
   "prs": [
+    {
+      "num": 71,
+      "title": "perf(moe): int8 dp4a MMVQ for the Q4_K MoE down projection (+5% decode)",
+      "areas": [
+        "kernels"
+      ],
+      "label": "M",
+      "tps": 333.75,
+      "delta_pct": 9.1,
+      "top1": 0.97,
+      "kl": 0.1507,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/71"
+    },
     {
       "num": 70,
       "title": "int8 mmvq for the last fp32-path GEMVs: attn-V + LM head (Q6_K) + gate/up (Q4_K) (+4.3%)",
