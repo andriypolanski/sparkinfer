@@ -94,7 +94,8 @@ window.SPARKINFER = {
       "delta_pct": null,
       "top1": 0.95,
       "kl": 0.2104,
-      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/83"
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/83",
+      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0083-e20b053"
     },
     {
       "num": 72,
@@ -107,7 +108,8 @@ window.SPARKINFER = {
       "delta_pct": 3.5,
       "top1": 0.97,
       "kl": 0.1417,
-      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/72"
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/72",
+      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0072-d459d58"
     },
     {
       "num": 73,
