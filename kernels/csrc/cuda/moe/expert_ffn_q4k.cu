@@ -424,16 +424,35 @@ __device__ __forceinline__ float si_vec_dot_q4_K(const si_block_q4_K* bq4, const
     float2 dm4f = __half22float2(bq4->dm);
     return dm4f.x * sumf_d - dm4f.y * sumf_m;
 }
+// Bit-identical to quant_h_q8_1_kernel for one ib, reading h[ts*F + f0 + lane].
+__device__ __forceinline__ void si_quant_h_block_q8_1(
+    const float* __restrict__ h, int ts, int f0, int F, int ib, si_block_q8_1* __restrict__ y) {
+    const int lane = threadIdx.x & 31;
+    float xv = h[(size_t)ts * F + f0 + lane], a = fabsf(xv);
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, m));
+    float d = a / 127.0f;
+    int qi = (a == 0.0f) ? 0 : (int)roundf(xv / d);
+    y[ib].qs[lane] = (signed char)qi;
+    int s = qi;
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) s += __shfl_xor_sync(0xffffffffu, s, m);
+    if (lane == 0) y[ib].ds = __floats2half2_rn(d, d * (float)s);
+}
+
 __global__ void gate_up_mmvq2_kernel(
     const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ gate_q,
     const unsigned char* __restrict__ up_q, const int* __restrict__ expert_ids,
-    float* __restrict__ h_scratch, int H, int F, int top_k
+    float* __restrict__ h_scratch, int H, int F, int top_k,
+    si_block_q8_1* __restrict__ hq8, unsigned int* __restrict__ q8_ready
 ) {
     si_pdl_lc();
     constexpr int NW = 4, WS = 32, vdr = 2, qi = 32;
     const int row = blockIdx.x, ts = row / F, f = row % F, tok = ts / top_k;
     const int e = expert_ids[ts];
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, tid = threadIdx.x;
+    const int q8pb = F >> 5;
+    const int ib = ts * q8pb + (f >> 5);
     const si_block_q8_1* vrow = vy + (size_t)tok * (H >> 5);
     const si_block_q4_K* g_row = (const si_block_q4_K*)(gate_q + ((size_t)e * F + f) * (H >> 8) * 144);
     const si_block_q4_K* u_row = (const si_block_q4_K*)(up_q   + ((size_t)e * F + f) * (H >> 8) * 144);
@@ -445,6 +464,7 @@ __global__ void gate_up_mmvq2_kernel(
         tu += si_vec_dot_q4_K(u_row + kbx, vrow + kby, kqs);
     }
     __shared__ float sg[NW - 1][WS], su[NW - 1][WS];
+    __shared__ int s_do_q8;
     if (warp > 0) { sg[warp - 1][lane] = tg; su[warp - 1][lane] = tu; }
     __syncthreads();
     if (warp > 0) return;
@@ -453,6 +473,18 @@ __global__ void gate_up_mmvq2_kernel(
     #pragma unroll
     for (int m = 16; m > 0; m >>= 1) { tg += __shfl_xor_sync(0xffffffff, tg, m); tu += __shfl_xor_sync(0xffffffff, tu, m); }
     if (lane == 0) h_scratch[(size_t)ts * F + f] = q4kf_silu(tg) * tu;
+
+    if (!hq8) return;
+
+    __threadfence();
+    if (lane == 0) {
+        const unsigned bit = 1u << (f & 31);
+        const unsigned prev = atomicOr(q8_ready + ib, bit);
+        s_do_q8 = ((prev | bit) == 0xFFFFFFFFu) ? 1 : 0;
+    }
+    __syncthreads();
+    if (!s_do_q8) return;
+    si_quant_h_block_q8_1(h_scratch, ts, (f >> 5) << 5, F, ib, hq8);
 }
 
 // int8 dp4a MMVQ down (Q4_K). The Q4_K-quantized down rows in Q4_K_M were the last MoE GEMV
@@ -627,7 +659,8 @@ void launch_moe_expert_ffn_q4k(
     int gate_type, int up_type, int down_type,
     const int* expert_ids, const float* expert_weights, void* output,
     float* h_scratch, float* out_scratch,
-    int num_tokens, int top_k, int hidden, int ffn, const void* input_q8, cudaStream_t stream
+    int num_tokens, int top_k, int hidden, int ffn, const void* input_q8,
+    unsigned int* q8_ready, cudaStream_t stream
 ) {
     // int8 dp4a path for Q4_K gate/up (decode parity with llama.cpp's MMVQ). Default
     // ON — the largest single decode cost; down stays on the fp path (Q6_K). Set
@@ -637,6 +670,10 @@ void launch_moe_expert_ffn_q4k(
 
     static int gu2 = -1;   // default ON: faithful 4-warp Q4_K mmvq gate/up. =0 falls back to #50 path
     if (gu2 < 0) { const char* g2 = getenv("SPARKINFER_GU2"); gu2 = (g2 && g2[0] == '0') ? 0 : 1; }
+    static int moedq = -1; // default ON: emit Q8_1(h) from gate_up tail, drop down quantize node. =0 disables
+    if (moedq < 0) { const char* md = getenv("SPARKINFER_MOEDQ"); moedq = (md && md[0] == '0') ? 0 : 1; }
+    const bool fuse_down_q8 = moedq && q8_ready != nullptr && input_q8 != nullptr;
+    si_block_q8_1* hq8 = fuse_down_q8 ? reinterpret_cast<si_block_q8_1*>(out_scratch) : nullptr;
     dim3 gu(num_tokens * top_k, (ffn + WPB - 1) / WPB);
     if (mmvq && gu2 && gate_type == 12 && up_type == 12) {   // faithful 4-warp mmvq gate/up
         const si_block_q8_1* q;
@@ -651,7 +688,8 @@ void launch_moe_expert_ffn_q4k(
         }
         gate_up_mmvq2_kernel<<<num_tokens * top_k * ffn, 4 * 32, 0, stream>>>(
             q, reinterpret_cast<const unsigned char*>(gate_q),
-            reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch, hidden, ffn, top_k);
+            reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch, hidden, ffn, top_k,
+            hq8, fuse_down_q8 ? q8_ready : nullptr);
     } else if (mmvq && gate_type == 12 && up_type == 12) {   // 12 = ggml Q4_K
         size_t sm = 2 * (size_t)(hidden >> 5) * sizeof(float) + (size_t)hidden;  // s_xd+s_xs+s_xq8
         gate_up_q4k_mmvq_kernel<<<gu, WPB * 32, sm, stream>>>(
@@ -676,11 +714,13 @@ void launch_moe_expert_ffn_q4k(
     static int down_mmvq = -1;
     if (down_mmvq < 0) { const char* dv = getenv("SPARKINFER_DOWN_MMVQ"); down_mmvq = (dv && dv[0] == '0') ? 0 : 1; }
     if (down_mmvq && down_type == 14) {   // 14 = ggml Q6_K
-        si_block_q8_1* hq8 = reinterpret_cast<si_block_q8_1*>(out_scratch);   // <= hidden floats; fits
-        const int nqb = num_tokens * top_k * (ffn >> 5);
-        const int qthreads = 256;
-        quant_h_q8_1_kernel<<<(nqb + (qthreads >> 5) - 1) / (qthreads >> 5), qthreads, 0, stream>>>(
-            h_scratch, hq8, nqb);
+        si_block_q8_1* down_q8 = reinterpret_cast<si_block_q8_1*>(out_scratch);
+        if (!fuse_down_q8) {
+            const int nqb = num_tokens * top_k * (ffn >> 5);
+            const int qthreads = 256;
+            quant_h_q8_1_kernel<<<(nqb + (qthreads >> 5) - 1) / (qthreads >> 5), qthreads, 0, stream>>>(
+                h_scratch, down_q8, nqb);
+        }
         // split-K MMVQ down (default S=4): S warps/row -> S*H warps in flight, hiding
         // the bs=1 occupancy stall the one-warp kernel hits. Falls back to one-warp if disabled.
         const int S = down_splitk_s();
@@ -688,13 +728,13 @@ void launch_moe_expert_ffn_q4k(
             const int RPB = WPB / S;
             dim3 dns(num_tokens, (hidden + RPB - 1) / RPB);
             if (launch_down_q6k_mmvq_splitk(S, dns,
-                    reinterpret_cast<const unsigned char*>(down_q), expert_ids, expert_weights, hq8,
+                    reinterpret_cast<const unsigned char*>(down_q), expert_ids, expert_weights, down_q8,
                     reinterpret_cast<__nv_bfloat16*>(output), hidden, ffn, top_k, stream))
                 return;
         }
         dim3 dnm(num_tokens, (hidden + WPB - 1) / WPB);
         down_q6k_mmvq_kernel<<<dnm, WPB * 32, 0, stream>>>(
-            reinterpret_cast<const unsigned char*>(down_q), expert_ids, expert_weights, hq8,
+            reinterpret_cast<const unsigned char*>(down_q), expert_ids, expert_weights, down_q8,
             reinterpret_cast<__nv_bfloat16*>(output), hidden, ffn, top_k);
         return;
     }
@@ -704,23 +744,25 @@ void launch_moe_expert_ffn_q4k(
     static int down_q4k = -1;
     if (down_q4k < 0) { const char* qv = getenv("SPARKINFER_DOWN_Q4K"); down_q4k = (qv && qv[0] == '0') ? 0 : 1; }
     if (down_mmvq && down_q4k && down_type == 12) {   // 12 = ggml Q4_K
-        si_block_q8_1* hq8 = reinterpret_cast<si_block_q8_1*>(out_scratch);
-        const int nqb = num_tokens * top_k * (ffn >> 5);
-        const int qthreads = 256;
-        quant_h_q8_1_kernel<<<(nqb + (qthreads >> 5) - 1) / (qthreads >> 5), qthreads, 0, stream>>>(
-            h_scratch, hq8, nqb);
+        si_block_q8_1* down_q8 = reinterpret_cast<si_block_q8_1*>(out_scratch);
+        if (!fuse_down_q8) {
+            const int nqb = num_tokens * top_k * (ffn >> 5);
+            const int qthreads = 256;
+            quant_h_q8_1_kernel<<<(nqb + (qthreads >> 5) - 1) / (qthreads >> 5), qthreads, 0, stream>>>(
+                h_scratch, down_q8, nqb);
+        }
         const int S = down_splitk_s();
         if (S > 1) {
             const int RPB = WPB / S;
             dim3 dns(num_tokens, (hidden + RPB - 1) / RPB);
             if (launch_down_q4k_mmvq_splitk(S, dns,
-                    reinterpret_cast<const unsigned char*>(down_q), expert_ids, expert_weights, hq8,
+                    reinterpret_cast<const unsigned char*>(down_q), expert_ids, expert_weights, down_q8,
                     reinterpret_cast<__nv_bfloat16*>(output), hidden, ffn, top_k, stream))
                 return;
         }
         dim3 dnm(num_tokens, (hidden + WPB - 1) / WPB);
         down_q4k_mmvq_kernel<<<dnm, WPB * 32, 0, stream>>>(
-            reinterpret_cast<const unsigned char*>(down_q), expert_ids, expert_weights, hq8,
+            reinterpret_cast<const unsigned char*>(down_q), expert_ids, expert_weights, down_q8,
             reinterpret_cast<__nv_bfloat16*>(output), hidden, ffn, top_k);
         return;
     }

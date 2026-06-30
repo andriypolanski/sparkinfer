@@ -65,6 +65,7 @@ void launch_moe_expert_ffn_q4k(
     float* h_scratch, float* out_scratch,
     int num_tokens, int top_k, int hidden, int ffn,
     const void* input_q8 = nullptr,   // pre-quantized Q8_1(input) from the fused norm; nullptr = quantize internally
+    unsigned int* q8_ready = nullptr, // per-layer slice for gate/up->down Q8_1 fusion; nullptr = standalone quant
     cudaStream_t stream = nullptr);
 
 }} // namespace sparkinfer::kernels

@@ -89,6 +89,11 @@ struct Qwen35Model::Impl {
     bool use_ropekv = true;// default ON: fused RoPE + KV-append (1 kernel vs 2). =0 disables
     bool use_fnq = true;   // default ON: post-MoE add_rmsnorm2 also emits Q8_1(xn), deleting the
                            // next layer's standalone QKV-input quantize node. =0 disables
+    bool use_moedq = true; // default ON: gate/up MMVQ tail emits Q8_1(h) for the down MMVQ,
+                           // deleting the per-layer quant_h node. =0 disables
+
+    unsigned int* q8_ready = nullptr;
+    int q8_ready_layer_stride = 0;
 
     template <class T> T* alloc(size_t n) { void* p=nullptr; cu(cudaMalloc(&p, n*sizeof(T)), "malloc"); return (T*)p; }
 };
@@ -143,12 +148,15 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
     p_->aq8_d = p_->alloc<float>(kmax >> 5);
     p_->aq8_s = p_->alloc<float>(kmax >> 5);
     p_->aq81  = p_->alloc<char>(kernels::llama_q8_1_bytes(kmax));
+    p_->q8_ready_layer_stride = cfg.top_k * (cfg.moe_ffn >> 5);
+    p_->q8_ready = p_->alloc<unsigned int>((size_t)cfg.n_layers * p_->q8_ready_layer_stride);
     if (const char* e = getenv("SPARKINFER_PQ"))    p_->use_pq    = !(e[0] == '0');
     if (const char* e = getenv("SPARKINFER_LLAMA")) p_->use_llama = !(e[0] == '0');
     if (const char* e = getenv("SPARKINFER_Q6MMVQ")) p_->use_q6mmvq = !(e[0] == '0');
     if (const char* e = getenv("SPARKINFER_QKFUSE")) p_->use_qkfuse = !(e[0] == '0');
     if (const char* e = getenv("SPARKINFER_ROPEKV")) p_->use_ropekv = !(e[0] == '0');
     if (const char* e = getenv("SPARKINFER_FNQ"))    p_->use_fnq   = !(e[0] == '0');
+    if (const char* e = getenv("SPARKINFER_MOEDQ"))  p_->use_moedq = !(e[0] == '0');
     if (const char* e = getenv("SPARKINFER_QKVSTREAM")) p_->use_qkvstream = !(e[0] == '0');
 }
 
@@ -163,6 +171,7 @@ Qwen35Model::~Qwen35Model() {
     cudaFree(p_->mf_ids); cudaFree(p_->mf_counts);
     cudaFree(p_->fa_m); cudaFree(p_->fa_l); cudaFree(p_->fa_acc);
     cudaFree(p_->aq8); cudaFree(p_->aq8_d); cudaFree(p_->aq8_s); cudaFree(p_->aq81);
+    cudaFree(p_->q8_ready);
     if (p_->graph_ready) { cudaGraphExecDestroy(p_->cu_exec); cudaGraphDestroy(p_->cu_graph); }
     cudaEventDestroy(p_->ev_qkv); cudaEventDestroy(p_->ev_k); cudaEventDestroy(p_->ev_v);
     cudaStreamDestroy(p_->stream_v); cudaStreamDestroy(p_->stream_k);
@@ -322,7 +331,9 @@ int Qwen35Model::forward_token(int token_id, int position) {
                                                w.gate_qtype, w.up_qtype, w.down_qtype,
                                                s.mf_ids, s.mf_weights, s.routed, s.mf_h, s.mf_out,
                                                1, c.top_k, c.hidden, c.moe_ffn,
-                                               fnq ? s.aq81 : nullptr, st);
+                                               fnq ? s.aq81 : nullptr,
+                                               (s.use_moedq && fnq) ? s.q8_ready + (size_t)L * s.q8_ready_layer_stride : nullptr,
+                                               st);
         } else {
             s.engine->set_layer_weights(L, {w.router_w, w.gate, w.up, w.down});
             s.engine->forward(s.hn, s.routed, 1, L, st);
