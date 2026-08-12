@@ -670,6 +670,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
 
         if (!moe) {
             // dense SwiGLU FFN, chunked over tokens (upstream #530): ffg/ffu/A_i8 stay O(FC*ffn).
+            const void* gate_pf = w.prefill_gate_q ? w.prefill_gate_q : w.gate_q;
+            const void* up_pf = w.prefill_up_q ? w.prefill_up_q : w.up_q;
+            const int gate_pf_type = w.prefill_gate_q ? w.prefill_gate_qtype : w.gate_qtype;
+            const int up_pf_type = w.prefill_up_q ? w.prefill_up_qtype : w.up_qtype;
             // Per-token independent, so this is numerically identical to the full-width pass.
             // Long-ctx: selective int8 FFN (GDN/attn stay bf16) + int8 weight cache across chunks.
             const bool ffn_i8 = use_i8_ffn && ffn_Wg_i8 != nullptr;
@@ -681,8 +685,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                 }
             };
             if (ffn_i8) {
-                dequant_w_i8(w.gate_qtype, w.gate_q, ffn_Wg_i8, ffn_swg, ffn, H);
-                dequant_w_i8(w.up_qtype,   w.up_q,   ffn_Wu_i8, ffn_swu, ffn, H);
+                dequant_w_i8(gate_pf_type, gate_pf, ffn_Wg_i8, ffn_swg, ffn, H);
+                dequant_w_i8(up_pf_type,   up_pf,   ffn_Wu_i8, ffn_swu, ffn, H);
                 dequant_w_i8(w.down_qtype, w.down_q, ffn_Wd_i8, ffn_swd, H, ffn);
             }
             // The down projection takes the int8 path on both branches whenever ffn_i8 or use_i8,
@@ -707,8 +711,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                         kernels::launch_prefill_gemm_i8(A_i8, ffn_Wd_i8, sx, ffn_swd,
                                                         ao + (size_t)fo * H, fn, H, ffn, st);
                 } else {
-                    proj(hn_c, w.gate_q, w.gate_qtype, ffg, ffn, H, fn);
-                    proj(hn_c, w.up_q,   w.up_qtype,   ffu, ffn, H, fn);
+                    proj(hn_c, gate_pf, gate_pf_type, ffg, ffn, H, fn);
+                    proj(hn_c, up_pf,   up_pf_type,   ffu, ffn, H, fn);
                     if (use_i8) {
                         // Same fused SwiGLU + per-row int8 quantize the long-ctx ffn_i8 branch
                         // runs (bit-identical to swiglu-then-quantize; both bf16-round first) --

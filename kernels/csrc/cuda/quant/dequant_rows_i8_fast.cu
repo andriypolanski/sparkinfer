@@ -33,6 +33,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include "sparkinfer/kernels/qtype.h"
 
 #include <cstdlib>
 
@@ -41,7 +42,7 @@ namespace kernels {
 
 namespace {
 
-enum { DQR_Q4_K = 12, DQR_Q5_K = 13, DQR_Q6_K = 14 };
+enum { DQR_Q4_K = 12, DQR_Q5_K = 13, DQR_Q6_K = 14, DQR_Q3_A = SI_QTYPE_Q3A };
 
 // --- decode helpers: byte-for-byte the ones in dequant_gguf.cu ---
 __device__ __forceinline__ float dqr_h2f(const unsigned char* p) {
@@ -62,6 +63,25 @@ __device__ __forceinline__ float dqr_q4k_val(const unsigned char* blk, int t) {
         m = (sc[j + 4] >> 4)  | ((sc[j]     >> 6) << 4);
     }
     return d * s * nib - dmin * m;
+}
+
+__device__ __forceinline__ float dqr_q3a_val(const unsigned char* blk, int t) {
+    const float d = dqr_h2f(blk), dmin = dqr_h2f(blk + 2);
+    const unsigned char* sc = blk + 4;
+    const unsigned char* qs = blk + 16;
+    const unsigned char* qh = blk + 80;
+    const int group = t >> 5, p = t & 31;
+    const int j = group >> 1, m = p >> 3, r = p & 7;
+    const int field = (group & 1) | ((r >> 2) << 1);
+    const int lo = (qs[16 * j + 4 * m + (r & 3)] >> (2 * field)) & 3;
+    const int hi = (qh[p] >> group) & 1;
+    int s, mn;
+    if (group < 4) { s = sc[group] & 63; mn = sc[group + 4] & 63; }
+    else {
+        s = (sc[group + 4] & 0xF) | ((sc[group - 4] >> 6) << 4);
+        mn = (sc[group + 4] >> 4) | ((sc[group] >> 6) << 4);
+    }
+    return d * s * (lo | (hi << 2)) - dmin * mn;
 }
 
 __device__ __forceinline__ float dqr_q5k_val(const unsigned char* blk, int t) {
@@ -102,13 +122,15 @@ template <int QT>
 __device__ __forceinline__ constexpr int dqr_bs() {
     if constexpr (QT == DQR_Q4_K) return 144;
     else if constexpr (QT == DQR_Q5_K) return 176;
-    else return 210;
+    else if constexpr (QT == DQR_Q6_K) return 210;
+    else return SI_QTYPE_Q3A;
 }
 template <int QT>
 __device__ __forceinline__ float dqr_val(const unsigned char* blk, int t) {
     if constexpr (QT == DQR_Q4_K) return dqr_q4k_val(blk, t);
     else if constexpr (QT == DQR_Q5_K) return dqr_q5k_val(blk, t);
-    else return dqr_q6k_val(blk, t);
+    else if constexpr (QT == DQR_Q6_K) return dqr_q6k_val(blk, t);
+    else return dqr_q3a_val(blk, t);
 }
 
 constexpr int DQR_BLOCK = 256, DQR_VEC = 4;   // 4 consecutive values/thread => 4B store, 128B/warp
@@ -636,6 +658,7 @@ bool launch_gguf_dequant_rows_i8_fast(int ggml_type, const void* src, signed cha
     if (ggml_type == DQR_Q4_K) return dispatch<DQR_Q4_K>(s, q, scale, rows, cols, stream);
     if (ggml_type == DQR_Q5_K) return dispatch<DQR_Q5_K>(s, q, scale, rows, cols, stream);
     if (ggml_type == DQR_Q6_K) return dispatch<DQR_Q6_K>(s, q, scale, rows, cols, stream);
+    if (ggml_type == DQR_Q3_A) return dispatch<DQR_Q3_A>(s, q, scale, rows, cols, stream);
     return false;
 }
 
@@ -656,6 +679,8 @@ bool launch_gguf_dequant_rows_i8_fast_pair(int ggml_type,
         return dispatch_pair<DQR_Q5_K>(s0, q0, scale0, s1, q1, scale1, rows, cols, stream);
     if (ggml_type == DQR_Q6_K)
         return dispatch_pair<DQR_Q6_K>(s0, q0, scale0, s1, q1, scale1, rows, cols, stream);
+    if (ggml_type == DQR_Q3_A)
+        return dispatch_pair<DQR_Q3_A>(s0, q0, scale0, s1, q1, scale1, rows, cols, stream);
     return false;
 }
 
