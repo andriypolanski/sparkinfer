@@ -149,3 +149,7 @@ but entry never landed on `main`. Maintainer confirmed block on 2026-07-16.
 `jony376` no longer exists (404); flagged PRs #209/#142 are under **`james3773`**. Added
 `james3773` to `blocked-contributors.txt` on 2026-07-16; kept `jony376` for historical
 commit-author matching.
+
+## 2026-08-12 — `petermilord` (auto-blocked)
+
+Blocked per maintainer directive (2026-08-12) — account flagged as blocked; PR #788 closed without evaluation.

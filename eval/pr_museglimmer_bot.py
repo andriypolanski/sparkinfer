@@ -1340,6 +1340,7 @@ def main():
 
     stale_closed = close_stale_museglimmer_prs(args.repo, prs, dry_run=args.dry_run) if not only else set()
 
+    denylist = arb.load_denylist()
     pending = []
     for pr in prs:
         num = pr["number"]
@@ -1348,6 +1349,16 @@ def main():
         if only and num not in only:
             continue
         if pr.get("isDraft"):
+            continue
+        # Gate — blocked contributor: never spend GPU on a flagged/sybil PR. Checks the opener
+        # AND every commit's author/committer (arb.pr_involved_logins), not just the PR's own
+        # author field — same "Gate 1" pattern pr_eval_bot.py's AR bot already uses, reused
+        # verbatim rather than reinvented.
+        hits = arb.pr_involved_logins(args.repo, num) & denylist
+        if hits:
+            print(f"PR #{num}: BLOCKED (denylisted: {', '.join(sorted(hits))}) — flag + close, no eval")
+            if not args.dry_run:
+                arb.close_blocked_pr(args.repo, num, hits)
             continue
         labs = {l["name"] for l in pr.get("labels", [])}
         if arb.HOLD_LABEL in labs:

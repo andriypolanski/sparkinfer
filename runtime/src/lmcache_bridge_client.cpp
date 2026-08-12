@@ -2,6 +2,34 @@
 // docs/lmcache_bridge_protocol.md -- keep both in sync by hand, there is no codegen here.
 #include "sparkinfer/lmcache_bridge_client.h"
 
+#ifdef _WIN32
+
+// AF_UNIX SOCK_SEQPACKET (the transport the real bridge below is built on) has no direct Windows
+// equivalent -- Windows' AF_UNIX support is SOCK_STREAM-only, which would need a real reframing
+// of this protocol, not a #ifdef. Every method here is already documented (see the class comment
+// in the header) to "degrade safely" when the sidecar is unreachable -- LOOKUP misses, STORE
+// no-ops, nothing surfaces as a request-visible error. This stub exercises exactly that path
+// unconditionally, so Muse/Qwen inference on Windows behaves the same as Linux with no sidecar
+// running: LMCache is simply never available there.
+namespace sparkinfer {
+
+struct BridgeClient::Impl {};
+
+BridgeClient::BridgeClient(std::string /*socket_path*/, BridgeKVLayout /*layout*/)
+    : impl_(new Impl()) {}
+BridgeClient::~BridgeClient() = default;
+
+bool BridgeClient::is_alive() const { return false; }
+LookupResult BridgeClient::lookup(const std::vector<int>& /*token_ids*/) { return LookupResult{}; }
+void BridgeClient::store_async(const std::vector<int>& /*token_ids*/, int /*new_start_tok*/,
+                               int /*new_end_tok*/, std::string /*shm_name*/) {}
+uint64_t BridgeClient::lookup_hit_count() const { return 0; }
+uint64_t BridgeClient::lookup_miss_count() const { return 0; }
+
+}  // namespace sparkinfer
+
+#else
+
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -488,3 +516,5 @@ uint64_t BridgeClient::lookup_miss_count() const {
 }
 
 } // namespace sparkinfer
+
+#endif  // _WIN32

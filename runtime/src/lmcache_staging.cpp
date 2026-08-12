@@ -10,10 +10,12 @@
 // to agree with each other.
 #include "sparkinfer/lmcache_staging.h"
 
+#ifndef _WIN32
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 #include <cstring>
 
 namespace sparkinfer {
@@ -117,6 +119,14 @@ bool stage_kv_to_shm(KVCacheManager& kv, const BridgeKVLayout& layout, uint64_t 
         return false;
     }
 
+#ifdef _WIN32
+    // Named POSIX shm (shm_open/mmap) has no direct Windows equivalent wired up yet -- the LMCache
+    // bridge is Linux-only for now (see lmcache_bridge_client.cpp's Windows stub); every caller of
+    // stage_kv_to_shm already treats `false` as "bridge unavailable, fall back to recompute", so
+    // this is a safe, fully-handled degradation rather than a crash or undefined behavior.
+    cudaFreeHost(h_staging);
+    return false;
+#else
     const int fd = shm_open(shm_name.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
     if (fd < 0) {
         cudaFreeHost(h_staging);
@@ -139,6 +149,7 @@ bool stage_kv_to_shm(KVCacheManager& kv, const BridgeKVLayout& layout, uint64_t 
     munmap(mapped, total_bytes);
     cudaFreeHost(h_staging);
     return true;
+#endif  // _WIN32
 }
 
 bool restore_kv_from_shm(KVCacheManager& kv, const BridgeKVLayout& layout, uint64_t seq_id,
@@ -156,6 +167,9 @@ bool restore_kv_from_shm(KVCacheManager& kv, const BridgeKVLayout& layout, uint6
     const size_t total_bytes = lmcache_chunk_byte_size(layout, len_tok);
     if (total_bytes == 0) return false;
 
+#ifdef _WIN32
+    return false;  // see the Windows note in stage_kv_to_shm above
+#else
     const int fd = shm_open(shm_name.c_str(), O_RDONLY, 0);
     if (fd < 0) return false;
     struct stat st;
@@ -200,6 +214,7 @@ bool restore_kv_from_shm(KVCacheManager& kv, const BridgeKVLayout& layout, uint6
 
     cudaFreeHost(h_staging);
     return ok;
+#endif  // _WIN32
 }
 
 } // namespace sparkinfer
