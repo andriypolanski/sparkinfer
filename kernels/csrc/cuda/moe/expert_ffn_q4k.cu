@@ -607,6 +607,37 @@ __global__ void gate_up_q3a_kernel(
     if (pdl) si_pdl_lc();
 }
 
+template <int H, int F>
+__global__ void gate_up_q3a_muse_kernel(
+    const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ gate_q,
+    const unsigned char* __restrict__ up_q, const int* __restrict__ expert_ids,
+    float* __restrict__ h_scratch, int pdl
+) {
+    constexpr int NW = 4, NB = H >> 8;
+    const int f = blockIdx.x;
+    const int e = expert_ids[0];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, tid = threadIdx.x;
+    const int kbx0 = tid >> 4, kqs = 2 * (tid & 15);
+    const si_block_q3_A* g_row = reinterpret_cast<const si_block_q3_A*>(gate_q + ((size_t)e * F + f) * NB * sizeof(si_block_q3_A));
+    const si_block_q3_A* u_row = reinterpret_cast<const si_block_q3_A*>(up_q + ((size_t)e * F + f) * NB * sizeof(si_block_q3_A));
+    float tg = 0.f, tu = 0.f;
+    #pragma unroll
+    for (int kbx = kbx0; kbx < NB; kbx += 8) {
+        tg += si_vec_dot_q3_A(g_row + kbx, vy + (size_t)kbx * 8, kqs);
+        tu += si_vec_dot_q3_A(u_row + kbx, vy + (size_t)kbx * 8, kqs);
+    }
+    __shared__ float sg[NW - 1][32], su[NW - 1][32];
+    if (warp > 0) { sg[warp - 1][lane] = tg; su[warp - 1][lane] = tu; }
+    __syncthreads();
+    if (warp > 0) return;
+    #pragma unroll
+    for (int w = 0; w < NW - 1; ++w) { tg += sg[w][lane]; tu += su[w][lane]; }
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) { tg += __shfl_xor_sync(0xffffffff, tg, m); tu += __shfl_xor_sync(0xffffffff, tu, m); }
+    if (lane == 0) h_scratch[f] = q4kf_silu(tg) * tu;
+    if (pdl) si_pdl_lc();
+}
+
 __global__ void gate_up_mmvq2_kernel(
     const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ gate_q,
     const unsigned char* __restrict__ up_q, const int* __restrict__ expert_ids,
@@ -1724,11 +1755,15 @@ void launch_moe_expert_ffn_q4k(
         // Q3_A gate/up first: every arm below hard-codes the 144-byte Q4_K super-block, so a
         // converted tensor reaching one of them would read the wrong stride.
         if (gate_type == SI_QTYPE_Q3A) {
-            launch_pdl_kernel(gu_pdl, dim3(num_tokens * top_k * ffn), dim3(4 * 32), 0, stream,
-                gate_up_q3a_kernel,
-                q, reinterpret_cast<const unsigned char*>(gate_q),
-                reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch,
-                hidden, ffn, top_k, gu_pdl);
+            static int q3_spec = -1;
+            if (q3_spec < 0) { const char* e = getenv("SPARKINFER_MUSE_Q3A_SPEC"); q3_spec = (e && e[0] == '0') ? 0 : 1; }
+            if (q3_spec && num_tokens == 1 && top_k == 1 && hidden == 6656 && ffn == 19968)
+                launch_pdl_kernel(gu_pdl, dim3(19968), dim3(4 * 32), 0, stream, gate_up_q3a_muse_kernel<6656, 19968>,
+                    q, reinterpret_cast<const unsigned char*>(gate_q), reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch, gu_pdl);
+            else
+                launch_pdl_kernel(gu_pdl, dim3(num_tokens * top_k * ffn), dim3(4 * 32), 0, stream, gate_up_q3a_kernel,
+                    q, reinterpret_cast<const unsigned char*>(gate_q), reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch,
+                    hidden, ffn, top_k, gu_pdl);
         } else if (num_tokens > 1 && gu_warps > 0 && gu_spec && hidden == 2048 && ffn == 512 && top_k == 8) {
             const int n_rows = num_tokens * top_k * ffn;
             launch_gate_up_warp_qwen<2048, 512, 8>(gu_warps, gu_pdl, n_rows, stream,
