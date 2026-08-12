@@ -8,6 +8,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include "sparkinfer/kernels/qtype.h"
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include <cuda_runtime.h>
 #include "sparkinfer/kernels/dequant_gguf_fast.h"
@@ -47,6 +48,30 @@ __global__ void deq_q4k_kernel(const unsigned char* __restrict__ src, __nv_bfloa
         for (int l = 0; l < 32; l++) yy[j + 32 + l] = __float2bfloat16(d2 * (q[l] >> 4)  - m2);
         q += 32; is += 2;
     }
+}
+
+__device__ __forceinline__ float deq_q3a_val(const unsigned char* blk, int t) {
+    const float d = gg_h2f(blk), dmin = gg_h2f(blk + 2);
+    const unsigned char* sc = blk + 4;
+    const unsigned char* qs = blk + 16;
+    const unsigned char* qh = blk + 80;
+    const int group = t >> 5, p = t & 31;
+    const int j = group >> 1, m = p >> 3, r = p & 7;
+    const int field = (group & 1) | ((r >> 2) << 1);
+    const int lo = (qs[16 * j + 4 * m + (r & 3)] >> (2 * field)) & 3;
+    const int hi = (qh[p] >> group) & 1;
+    int s, mn;
+    gg_scale_min_k4(group, sc, &s, &mn);
+    return d * s * (lo | (hi << 2)) - dmin * mn;
+}
+
+__global__ void deq_q3a_kernel(const unsigned char* __restrict__ src,
+                               __nv_bfloat16* __restrict__ y, long nblocks) {
+    const long b = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= nblocks) return;
+    const unsigned char* blk = src + b * SI_QTYPE_Q3A;
+    __nv_bfloat16* yy = y + b * 256;
+    for (int t = 0; t < 256; ++t) yy[t] = __float2bfloat16(deq_q3a_val(blk, t));
 }
 
 // Q5_K: 176-byte super-block of 256 — d, dmin (fp16), 6-bit scales+mins (12B, like Q4_K),
@@ -142,11 +167,11 @@ __device__ __forceinline__ float deq_q6k_val(const unsigned char* blk, int t) {
 // i8 path (the previous cols>4096 early-return regressed Qwythos @4k prefill ~10%).
 static constexpr int kDeqRowsI8MaxNsb = 8;
 
-template <int QT, int NSB>   // QT: 12=Q4_K, 13=Q5_K, 14=Q6_K; NSB = cols/256
+template <int QT, int NSB>   // QT: 12=Q4_K, 13=Q5_K, 14=Q6_K, 112=Q3_A; NSB = cols/256
 __global__ void deq_rows_i8_kernel(const unsigned char* __restrict__ src,
                                    signed char* __restrict__ q, float* __restrict__ scale,
                                    int cols) {
-    constexpr int BS = (QT == 12) ? 144 : (QT == 13) ? 176 : 210;
+    constexpr int BS = (QT == 12) ? 144 : (QT == 13) ? 176 : (QT == 14) ? 210 : SI_QTYPE_Q3A;
     const int row = blockIdx.x, t = threadIdx.x;
     const unsigned char* rbase = src + (size_t)row * NSB * BS;
 
@@ -156,7 +181,8 @@ __global__ void deq_rows_i8_kernel(const unsigned char* __restrict__ src,
     for (int sb = 0; sb < NSB; sb++) {
         const unsigned char* blk = rbase + (size_t)sb * BS;
         const float v = (QT == 12) ? deq_q4k_val(blk, t)
-                      : (QT == 13) ? deq_q5k_val(blk, t) : deq_q6k_val(blk, t);
+                      : (QT == 13) ? deq_q5k_val(blk, t)
+                      : (QT == 14) ? deq_q6k_val(blk, t) : deq_q3a_val(blk, t);
         vals[sb] = v;
         amax = fmaxf(amax, fabsf(v));
     }
@@ -187,7 +213,7 @@ template <int QT>
 __global__ void deq_rows_i8_twopass_kernel(const unsigned char* __restrict__ src,
                                            signed char* __restrict__ q, float* __restrict__ scale,
                                            int cols) {
-    constexpr int BS = (QT == 12) ? 144 : (QT == 13) ? 176 : 210;
+    constexpr int BS = (QT == 12) ? 144 : (QT == 13) ? 176 : (QT == 14) ? 210 : SI_QTYPE_Q3A;
     const int row = blockIdx.x, t = threadIdx.x;
     const int nsb = cols >> 8;
     const unsigned char* rbase = src + (size_t)row * nsb * BS;
@@ -196,7 +222,8 @@ __global__ void deq_rows_i8_twopass_kernel(const unsigned char* __restrict__ src
     for (int sb = 0; sb < nsb; sb++) {
         const unsigned char* blk = rbase + (size_t)sb * BS;
         const float v = (QT == 12) ? deq_q4k_val(blk, t)
-                      : (QT == 13) ? deq_q5k_val(blk, t) : deq_q6k_val(blk, t);
+                      : (QT == 13) ? deq_q5k_val(blk, t)
+                      : (QT == 14) ? deq_q6k_val(blk, t) : deq_q3a_val(blk, t);
         amax = fmaxf(amax, fabsf(v));
     }
     __shared__ float swarp[8];
@@ -219,7 +246,8 @@ __global__ void deq_rows_i8_twopass_kernel(const unsigned char* __restrict__ src
     for (int sb = 0; sb < nsb; sb++) {
         const unsigned char* blk = rbase + (size_t)sb * BS;
         const float v = (QT == 12) ? deq_q4k_val(blk, t)
-                      : (QT == 13) ? deq_q5k_val(blk, t) : deq_q6k_val(blk, t);
+                      : (QT == 13) ? deq_q5k_val(blk, t)
+                      : (QT == 14) ? deq_q6k_val(blk, t) : deq_q3a_val(blk, t);
         qrow[sb * 256 + t] = (signed char)(int)roundf(v * inv);
     }
 }
@@ -283,6 +311,7 @@ void launch_gguf_dequant(int ggml_type, const void* src, void* dst_bf16, long n_
     auto* s = reinterpret_cast<const unsigned char*>(src);
     const int T = 256;
     if (ggml_type == GGML_Q4_K) { long nb = n_values/256; deq_q4k_kernel<<<(nb+T-1)/T,T,0,stream>>>(s,d,nb); }
+    else if (ggml_type == SI_QTYPE_Q3A) { long nb = n_values/256; deq_q3a_kernel<<<(nb+T-1)/T,T,0,stream>>>(s,d,nb); }
     else if (ggml_type == GGML_Q5_K) { long nb = n_values/256; deq_q5k_kernel<<<(nb+T-1)/T,T,0,stream>>>(s,d,nb); }
     else if (ggml_type == GGML_Q6_K) { long nb = n_values/256; deq_q6k_kernel<<<(nb+T-1)/T,T,0,stream>>>(s,d,nb); }
     else if (ggml_type == GGML_Q8_0) { long nb = n_values/32;  deq_q8_0_kernel<<<(nb+T-1)/T,T,0,stream>>>(s,d,nb); }
@@ -315,6 +344,7 @@ bool launch_gguf_dequant_rows_i8(int ggml_type, const void* src, signed char* q,
         if (ggml_type == GGML_Q4_K)      { SI_BY_NSB(12); }
         else if (ggml_type == GGML_Q5_K) { SI_BY_NSB(13); }
         else if (ggml_type == GGML_Q6_K) { SI_BY_NSB(14); }
+        else if (ggml_type == SI_QTYPE_Q3A) { SI_BY_NSB(SI_QTYPE_Q3A); }
         else return false;
         #undef SI_BY_NSB
         #undef SI_LAUNCH
@@ -323,6 +353,7 @@ bool launch_gguf_dequant_rows_i8(int ggml_type, const void* src, signed char* q,
         if (ggml_type == GGML_Q4_K)      deq_rows_i8_twopass_kernel<12><<<rows, 256, 0, stream>>>(s, q, scale, cols);
         else if (ggml_type == GGML_Q5_K) deq_rows_i8_twopass_kernel<13><<<rows, 256, 0, stream>>>(s, q, scale, cols);
         else if (ggml_type == GGML_Q6_K) deq_rows_i8_twopass_kernel<14><<<rows, 256, 0, stream>>>(s, q, scale, cols);
+        else if (ggml_type == SI_QTYPE_Q3A) deq_rows_i8_twopass_kernel<SI_QTYPE_Q3A><<<rows, 256, 0, stream>>>(s, q, scale, cols);
         else return false;
     }
     return true;

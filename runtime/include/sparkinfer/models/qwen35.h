@@ -76,6 +76,10 @@ struct Qwen35LayerWeights {
     // instead of using the bf16 gate/up/down above. *_qtype are ggml type ids.
     const void* gate_q = nullptr; const void* up_q = nullptr; const void* down_q = nullptr;
     int gate_qtype = 0, up_qtype = 0, down_qtype = 0;
+    // Optional native gate/up copies retained for batched prefill when decode uses an
+    // internal compact format. Decode continues to read gate_q/up_q.
+    const void* prefill_gate_q = nullptr; const void* prefill_up_q = nullptr;
+    int prefill_gate_qtype = 0, prefill_up_qtype = 0;
     // attention projections: 0 = bf16 dense (default); else ggml type id (12=Q4_K,
     // 14=Q6_K) -> weights kept quantized in VRAM, decoded on-read by launch_gemv_q.
     int wq_type = 0, wgate_type = 0, wk_type = 0, wv_type = 0, wo_type = 0;

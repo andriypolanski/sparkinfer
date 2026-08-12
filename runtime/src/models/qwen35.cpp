@@ -3071,7 +3071,8 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     // si_vec_dot_q3_A, so the matrix is read 22.2% smaller on every decode token. Sources
     // Q4_K/Q5_K/Q6_K straight to Q3_A (one dequant, one fit). Falls back to the untouched source
     // on any failure.
-    auto dev_quant_q3a = [&](const std::string& name, int& qtype) -> const void* {
+    auto dev_quant_q3a = [&](const std::string& name, int& qtype,
+                                 const void** prefill_q, int* prefill_qtype) -> const void* {
         const void* src = dev_quant(name, qtype);
         if (!src) return src;
         if (qtype != 12 && qtype != 13 && qtype != 14) return src;   // Q4_K / Q5_K / Q6_K
@@ -3086,7 +3087,10 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         kernels::launch_ffn_requant_q3a(deq, q3, nv, s.stream);
         cudaStreamSynchronize(s.stream);
         cudaFree(deq);
-        if (!s.owned.empty() && s.owned.back() == src) { s.owned.pop_back(); cudaFree((void*)src); }
+        // Keep the native source resident for batched prefill. Its established Q4_K/Q5_K/Q6_K
+        // dequantizer is faster there; decode reads only the compact Q3_A copy.
+        if (prefill_q) *prefill_q = src;
+        if (prefill_qtype) *prefill_qtype = qtype;
         s.owned.push_back(q3);
         qtype = kernels::SI_QTYPE_Q3A;
         return q3;
@@ -3477,9 +3481,9 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             // consumes equal-stride pairs; unselected layers retain the native Q4_K path.
             const bool gu3 = ffn_q3a_on("ffn_gate") && ffn_q3a_on("ffn_up") &&
                              int_list_has(ffn_q3a_layers, i);
-            w.gate_q = gu3 ? dev_quant_q3a(b + "ffn_gate.weight", w.gate_qtype)
+            w.gate_q = gu3 ? dev_quant_q3a(b + "ffn_gate.weight", w.gate_qtype, &w.prefill_gate_q, &w.prefill_gate_qtype)
                            : dev_quant(b + "ffn_gate.weight", w.gate_qtype);
-            w.up_q   = gu3 ? dev_quant_q3a(b + "ffn_up.weight", w.up_qtype)
+            w.up_q   = gu3 ? dev_quant_q3a(b + "ffn_up.weight", w.up_qtype, &w.prefill_up_q, &w.prefill_up_qtype)
                            : dev_quant(b + "ffn_up.weight", w.up_qtype);
             w.down_q = dev_quant_down(b + "ffn_down.weight", w.down_qtype);
         } else {
@@ -3642,8 +3646,12 @@ bool Qwen35Model::load_gguf(const std::string& path) {
                 place(lw.wk,     lw.wk_type,     &lw.wk_rs,    kd, H);
                 place(lw.wv,     lw.wv_type,     &lw.wv_rs,    kd, H);
                 place(lw.wo,     lw.wo_type,     &lw.wo_rs,    H,  qd);
-                place(lw.gate_q, lw.gate_qtype,  &lw.gate_rs,  ff, H);
-                place(lw.up_q,   lw.up_qtype,    &lw.up_rs,    ff, H);
+                place(lw.prefill_gate_q ? lw.prefill_gate_q : lw.gate_q,
+                      lw.prefill_gate_q ? lw.prefill_gate_qtype : lw.gate_qtype,
+                      &lw.gate_rs, ff, H);
+                place(lw.prefill_up_q ? lw.prefill_up_q : lw.up_q,
+                      lw.prefill_up_q ? lw.prefill_up_qtype : lw.up_qtype,
+                      &lw.up_rs, ff, H);
                 place(lw.down_q, lw.down_qtype,  &lw.down_rs,  H,  ff);
             }
             if (ok) ok = cudaStreamSynchronize(s.stream) == cudaSuccess;

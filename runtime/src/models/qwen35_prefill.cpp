@@ -791,6 +791,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
 
         if (!moe) {
             // dense SwiGLU FFN, chunked over tokens (upstream #530): ffg/ffu/A_i8 stay O(FC*ffn).
+            const void* gate_pf = w.prefill_gate_q ? w.prefill_gate_q : w.gate_q;
+            const void* up_pf = w.prefill_up_q ? w.prefill_up_q : w.up_q;
+            const int gate_pf_type = w.prefill_gate_q ? w.prefill_gate_qtype : w.gate_qtype;
+            const int up_pf_type = w.prefill_up_q ? w.prefill_up_qtype : w.up_qtype;
             // Per-token independent, so this is numerically identical to the full-width pass.
             // Long-ctx: selective int8 FFN (GDN/attn stay bf16) + int8 weight cache across chunks.
             const bool ffn_i8 = use_i8_ffn && ffn_Wg_i8 != nullptr;
@@ -802,8 +806,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                 }
             };
             if (ffn_i8) {
-                dequant_w_i8(w.gate_qtype, w.gate_q, ffn_Wg_i8, ffn_swg, ffn, H);
-                dequant_w_i8(w.up_qtype,   w.up_q,   ffn_Wu_i8, ffn_swu, ffn, H);
+                dequant_w_i8(gate_pf_type, gate_pf, ffn_Wg_i8, ffn_swg, ffn, H);
+                dequant_w_i8(up_pf_type,   up_pf,   ffn_Wu_i8, ffn_swu, ffn, H);
                 dequant_w_i8(w.down_qtype, w.down_q, ffn_Wd_i8, ffn_swd, H, ffn);
             }
             // The down projection takes the int8 path on both branches whenever ffn_i8 or use_i8,
@@ -828,26 +832,24 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                         kernels::launch_prefill_gemm_i8(A_i8, ffn_Wd_i8, sx, ffn_swd,
                                                         ao + (size_t)fo * H, fn, H, ffn, st);
                 } else {
-                    // gate and up read the same hn chunk over the same K, so they are one grid for
-                    // the same reason q/gate/k/v are: two 312-tile launches each leave a partial
-                    // wave on a 510-block device, and one 624-tile launch leaves only one.
-                    // SPARKINFER_MUSE_FFN_GROUP=0 restores the two launches (A/B).
+                    // Group the retained native prefill weights; decode-only Q3_A buffers are not
+                    // supported by this fused Q4_K/Q5_K prefill kernel.
                     bool ffn_grouped = false;
                     if (muse_ffn_group && muse_qb && use_i8 && w.gate_rs && w.up_rs &&
-                        w.gate_qtype == w.up_qtype &&
-                        kernels::pfm_moe_gemm_qi8_supported(w.gate_qtype)) {
-                        const void*  Wf[2]  = { w.gate_q, w.up_q };
+                        gate_pf_type == up_pf_type &&
+                        kernels::pfm_moe_gemm_qi8_supported(gate_pf_type)) {
+                        const void*  Wf[2]  = { gate_pf, up_pf };
                         const float* rsf[2] = { w.gate_rs, w.up_rs };
                         void*        Cf[2]  = { ffg, ffu };
                         const int    nf[2]  = { ffn, ffn };
                         quant_a_i8(hn_c, fn, H);
                         ffn_grouped = kernels::launch_prefill_gemm_qi8_dense_group(
-                            w.gate_qtype, A_i8, sx, Wf, rsf, Cf, nf, 2, fn, H, st,
+                            gate_pf_type, A_i8, sx, Wf, rsf, Cf, nf, 2, fn, H, st,
                             qb_partials, QB_SPLITS, qb_partials_cap);
                     }
                     if (!ffn_grouped) {
-                        proj_fused(hn_c, w.gate_q, w.gate_qtype, w.gate_rs, ffg, ffn, H, fn);
-                        proj_fused(hn_c, w.up_q,   w.up_qtype,   w.up_rs,   ffu, ffn, H, fn);
+                        proj_fused(hn_c, gate_pf, gate_pf_type, w.gate_rs, ffg, ffn, H, fn);
+                        proj_fused(hn_c, up_pf,   up_pf_type,   w.up_rs,   ffu, ffn, H, fn);
                     }
                     if (use_i8) {
                         // Same fused SwiGLU + per-row int8 quantize the long-ctx ffn_i8 branch
