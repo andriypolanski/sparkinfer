@@ -2,16 +2,24 @@
 """sparkinfer Muse Glimmer PR auto-evaluator.
 
 Sibling of pr_dflash_bot.py — narrowly scoped to Muse Glimmer's plain AR (autoregressive)
-decode at 128-token context ONLY. Not DFlash, not long-context, not prefill. This scope is
-deliberate: Muse Glimmer is a very young architecture (4 real correctness bugs found and fixed
-in a single bring-up session, commit 6d911d4 and preceding) with essentially zero production
-track record, so this bot stays small and strict rather than growing the same multi-context /
-cross-model-guard surface pr_dflash_bot.py has.
+decode + 128-ctx prefill. Not DFlash, not long-context beyond 128. This scope is deliberate:
+Muse Glimmer is a very young architecture (4 real correctness bugs found and fixed in a single
+bring-up session, commit 6d911d4 and preceding) with essentially zero production track record,
+so this bot stays small and strict rather than growing the same multi-context / cross-model-guard
+surface pr_dflash_bot.py has.
 
 Scoring, same-box PR-vs-main on a single pinned GPU:
-  1. Speed  — qwen3_gguf_bench <gguf> 128 0 (128-token decode, no prefill context), PR vs a
-              freshly-measured origin/main, same box, same run. Same tier buckets as the AR and
-              DFlash bots (BUCKETS/SIG/REGRESS_TOL below — copied, not reinvented).
+  1. Speed  — decode (ctx=0) AND prefill@128 (ctx=128), one Muse Glimmer model load via
+              bench_sweep_run, PR vs a freshly-measured origin/main, same box, same run. Same
+              tier buckets as the AR and DFlash bots (BUCKETS/SIG/REGRESS_TOL below — copied,
+              not reinvented). The two dimensions share a regression floor — REGRESS_TOL failing
+              on EITHER is a hard REJECT — but otherwise take the BETTER of the two tiers: a PR
+              that improves one dimension with the other merely flat (not regressed) still earns
+              credit for the real improvement it made, e.g. an XL decode win paired with a flat
+              prefill still reports XL. Added 2026-08-12 (pt. 4 below) because Muse Glimmer's
+              `batched_prefill_enabled()` always returns false (its SWA/NoPE per-layer pattern
+              has no batched kernel yet), so it *always* pays the slow token-loop prefill path —
+              a decode-only gate could never see a prefill-specific regression.
   2. Accuracy gate — teacher-forced qwen3_gguf_score vs a live llama-server reference on the
               SAME GGUF, exactly the methodology validated by hand this session (commit
               6d911d4's message): qwen3_gguf_score dumps sparkinfer's per-position distribution,
@@ -43,6 +51,13 @@ evaluation scope.
               of regression before merge, not after. Scoped to Qwen3.6 only (not Qwythos/Qwen3.5)
               per explicit instruction, 2026-08-12 — narrower than the DFlash bot's guard, in
               keeping with this bot's own "stay small and strict" design goal above.
+
+  4. 128-ctx prefill scoring — see pt. 1's shared-floor/best-of-the-rest description. Reverses
+              the earlier "not prefill" scope decision at the top of this docstring; unlike the
+              Qwen3.6 guard
+              (pt. 3, a pass/fail gate on a DIFFERENT model), this is Muse Glimmer's own second
+              first-class scored dimension. EVAL_SCHEMA_VERSION bumped to v3-prefill128 — a PR
+              evaluated before this existed must not keep a decode-only-scored label forever.
 
   python eval/pr_museglimmer_bot.py --instance 46074104
   python eval/pr_museglimmer_bot.py --only-prs 636 --reeval
@@ -90,10 +105,10 @@ ACC_KL_BAR = float(os.environ.get("MUSEGLIMMER_ACC_KL_BAR", "0.10"))
 EVAL_PREFIX = "eval-museglimmer:"
 MUSEGLIMMER_MERGE_FIRST = "museglimmer-merge-first"
 MUSEGLIMMER_NEEDS_REBASE = "museglimmer-needs-rebase"
-# Bumped for the Qwen3.6 no-regression guard (see module docstring, pt. 3) — same reasoning as
-# pr_dflash_bot.py's own v2-qwenguard bump: a PR evaluated before the guard existed must not keep
-# an unguarded label/score forever, so its stale marker deliberately stops matching.
-EVAL_SCHEMA_VERSION = "v2-q36guard"
+# Bumped for the Qwen3.6 no-regression guard (see module docstring, pt. 3), then again for
+# 128-ctx prefill scoring (pt. 4) — same reasoning as pr_dflash_bot.py's own v2-qwenguard bump: a
+# PR evaluated before a scoring change existed must not keep a stale-scored label/score forever.
+EVAL_SCHEMA_VERSION = "v3-prefill128"
 MARKER_RE = re.compile(
     r"<!-- sparkinfer-museglimmer-eval:" + re.escape(EVAL_SCHEMA_VERSION) + r":([0-9a-f]+)(?:\s+(\{.*?\}))? -->",
     re.DOTALL,
@@ -182,24 +197,30 @@ def _save_scores(data):
         print(f">> museglimmer scores save skipped: {e}")
 
 
-def tier_from_gain(pr_tps: float, main_tps: float):
+def tier_from_gain(pr_tps: float, main_tps: float, metric: str = "decode"):
     """Return (label, delta_pct, pass_ok, reason). Identical logic to pr_dflash_bot.py's
-    tier_from_gain — same bucket thresholds, same no-regression floor."""
+    tier_from_gain — same bucket thresholds, same no-regression floor. `metric` only affects the
+    reason text — lets prefill@128 scoring reuse this verbatim instead of duplicating it (this
+    codebase's "copied, not reinvented" convention) while still reporting which dimension a
+    regression/improvement actually came from."""
     if main_tps <= 0:
-        return "REJECT", 0.0, False, "main decode baseline is 0"
+        return "REJECT", 0.0, False, f"main {metric} baseline is 0"
     if pr_tps < REGRESS_TOL * main_tps:
         pct = 100.0 * (pr_tps - main_tps) / main_tps
         return "REJECT", round(pct, 1), False, (
-            f"decode regression: {pr_tps:.2f} < {100 * REGRESS_TOL:.0f}% of main {main_tps:.2f}"
+            f"{metric} regression: {pr_tps:.2f} < {100 * REGRESS_TOL:.0f}% of main {main_tps:.2f}"
         )
     g = (pr_tps - main_tps) / main_tps
     pct = round(100.0 * g, 1)
     if g < SIG:
-        return "none", pct, True, "within significance gate — not a verified decode improvement"
+        return "none", pct, True, f"within significance gate — not a verified {metric} improvement"
     for thr, name in BUCKETS:
         if g >= thr:
             return name, pct, True, "ok"
     return "none", pct, True, "ok"
+
+
+_TIER_RANK = {"REJECT": -1, "none": 0, "XS": 1, "S": 2, "M": 3, "L": 4, "XL": 5}
 
 
 def check_q36_guard(pr: dict, main: dict, tol: float = REGRESS_TOL):
@@ -505,12 +526,23 @@ test -x build/runtime/qwen3_gguf_bench
 test -x build/runtime/qwen3_gguf_score
 
 # --- 128-token decode speed (ctx=0, n=128 — the SAME "128-context, no prefill" convention the
-# rest of this codebase's decode buckets use, e.g. pr_eval_bot.py's CTX_SERIES[128]) ---
+# rest of this codebase's decode buckets use, e.g. pr_eval_bot.py's CTX_SERIES[128]) PLUS
+# 128-ctx prefill throughput, from ONE Muse Glimmer model load via the same JSON-sweep mechanism
+# the Qwen3.6 guard below already uses — sourced here (not just before the guard) so both share
+# it instead of reloading the ~17GB GGUF twice for two separate single-context bench calls.
+source bench/scripts/_common.sh
+source bench/scripts/_eval_speed.sh
+SI_BIN="$PWD/build/runtime"; SI_LD=""
 wait_gpu_clear
-OUT=$(build/runtime/qwen3_gguf_bench "$GGUF" "$NTOK" 0)
-echo "$OUT"
-DECODE_TPS=$(echo "$OUT" | grep 'decode tg' | tail -1 | sed -E 's/.*decode tg[[:space:]]*:[[:space:]]*([0-9.]+).*/\\1/')
+if bench_sweep_run "$GGUF" "$NTOK" 0 1 128 1; then
+  DECODE_TPS=$(_bench_sweep_get 0 decode_tps)
+  PREFILL128_PP=$(_bench_sweep_get 128 prefill_pp)
+else
+  DECODE_TPS=0
+  PREFILL128_PP=0
+fi
 echo "RESULT_DECODE_TPS ${{DECODE_TPS:-0}}"
+echo "RESULT_PREFILL128_PP ${{PREFILL128_PP:-0}}"
 
 # --- accuracy gate: sparkinfer teacher-forced score vs a live llama-server reference, same
 # GGUF, same eval_text.txt corpus this session already validated by hand (6d911d4) ---
@@ -597,16 +629,13 @@ echo "RESULT_PPL_LLAMA ${{PPLL:-0}}"
 # (module docstring, pt. 3). A separate GGUF/model load from Muse Glimmer's own — a shared-code
 # regression that only shows up on Qwen3.6's architecture would otherwise slip past this bot
 # entirely, as it did for the LMCache integration (PR #775) until checked by hand.
-# _eval_speed.sh's si_run/bench_sweep_run assume _common.sh's ensure_model/ensure_tokenizer/si_run
-# are already sourced (same load order as pr_dflash_bot.py's GUARD36 block) — not implicit.
-source bench/scripts/_common.sh
-source bench/scripts/_eval_speed.sh
+# _common.sh/_eval_speed.sh/SI_BIN already sourced above for the decode+prefill128 sweep — reused
+# here, not re-sourced.
 export MODELS_DIR="$Q36_GUARD_MODELS_DIR" MODEL_REPO="$Q36_GUARD_MODEL_REPO" \\
        MODEL_FILE="$Q36_GUARD_MODEL_FILE" TOK_REPO="$Q36_GUARD_TOK_REPO"
 export MODEL_SHA256="${{QWEN36_MODEL_SHA256:-}}"
 ( ensure_model && ensure_tokenizer ) || echo "WARN: qwen3.6 guard model setup failed" >&2
 Q36_GGUF="$Q36_GUARD_MODELS_DIR/$Q36_GUARD_MODEL_FILE"
-SI_BIN="$PWD/build/runtime"; SI_LD=""
 
 echo "GUARD_START"
 wait_gpu_clear
@@ -630,6 +659,11 @@ def _parse_remote(stdout: str) -> dict:
         elif line.startswith("RESULT_DECODE_TPS "):
             try:
                 out["decode_tps"] = float(line.split()[1])
+            except ValueError:
+                pass
+        elif line.startswith("RESULT_PREFILL128_PP "):
+            try:
+                out["prefill128_pp"] = float(line.split()[1])
             except ValueError:
                 pass
         elif line.startswith("RESULT_TOP1 "):
@@ -833,6 +867,8 @@ def measure_main_baseline(host, port):
     main = _parse_remote(r.stdout or "")
     if "decode_tps" not in main:
         return {"ok": False, "reason": "main bench missing decode tok/s", "log": (r.stdout or "")[-1500:]}
+    if "prefill128_pp" not in main:
+        return {"ok": False, "reason": "main bench missing prefill@128 pp tok/s", "log": (r.stdout or "")[-1500:]}
     main["ok"] = True
     return main
 
@@ -850,11 +886,36 @@ def eval_museglimmer_on_box(host, port, pr_ref: str, main: dict):
     pr = _parse_remote(r.stdout or "")
     if "decode_tps" not in pr:
         return {"ok": False, "reason": "PR bench missing decode tok/s", "log": (r.stdout or "")[-1500:]}
+    if "prefill128_pp" not in pr:
+        return {"ok": False, "reason": "PR bench missing prefill@128 pp tok/s", "log": (r.stdout or "")[-1500:]}
     if "top1" not in pr or "kl" not in pr:
         return {"ok": False, "reason": "PR run missing accuracy METRIC line", "log": (r.stdout or "")[-1500:]}
-    print(f">> PR decode={pr['decode_tps']:.2f} top1={pr.get('top1', 0):.3f} kl={pr.get('kl', 99):.4f}")
+    print(f">> PR decode={pr['decode_tps']:.2f} prefill128={pr['prefill128_pp']:.2f} "
+          f"top1={pr.get('top1', 0):.3f} kl={pr.get('kl', 99):.4f}")
 
-    label, delta_pct, passed, speed_reason = tier_from_gain(pr["decode_tps"], main["decode_tps"])
+    decode_label, decode_delta_pct, decode_passed, decode_reason = tier_from_gain(
+        pr["decode_tps"], main["decode_tps"], metric="decode")
+    prefill_label, prefill_delta_pct, prefill_passed, prefill_reason = tier_from_gain(
+        pr["prefill128_pp"], main["prefill128_pp"], metric="prefill@128")
+
+    # Shared regression floor, best-of-the-rest: either dimension regressing is a hard REJECT
+    # regardless of the other (same conservative, fail-closed philosophy as the accuracy gate and
+    # Q36 guard below, module docstring pt. 4) — but a PR that improves ONE dimension with the
+    # OTHER merely flat (not regressed) still earns credit for the real improvement it made. A
+    # pure prefill@128 optimization with unchanged decode should score on its own merits, not get
+    # dragged down to "none" just because decode wasn't also touched — no different from how a
+    # decode-only PR was never expected to also move prefill.
+    if decode_label == "REJECT" and prefill_label == "REJECT":
+        label, delta_pct, passed = "REJECT", min(decode_delta_pct, prefill_delta_pct), False
+        speed_reason = f"{decode_reason} | {prefill_reason}"
+    elif decode_label == "REJECT":
+        label, delta_pct, passed, speed_reason = "REJECT", decode_delta_pct, False, decode_reason
+    elif prefill_label == "REJECT":
+        label, delta_pct, passed, speed_reason = "REJECT", prefill_delta_pct, False, prefill_reason
+    elif _TIER_RANK[decode_label] >= _TIER_RANK[prefill_label]:
+        label, delta_pct, passed, speed_reason = decode_label, decode_delta_pct, decode_passed, decode_reason
+    else:
+        label, delta_pct, passed, speed_reason = prefill_label, prefill_delta_pct, prefill_passed, prefill_reason
 
     pr_top1 = pr.get("top1", 0.0)
     pr_kl = pr.get("kl", 99.0)
@@ -888,7 +949,14 @@ def eval_museglimmer_on_box(host, port, pr_ref: str, main: dict):
         "delta_pct": delta_pct,
         "pr_decode_tps": pr["decode_tps"],
         "main_decode_tps": main["decode_tps"],
+        "decode_delta_pct": decode_delta_pct,
+        "decode_regressed": decode_label == "REJECT",
         "speedup_vs_main": round(pr["decode_tps"] / main["decode_tps"], 3) if main.get("decode_tps") else 0,
+        "pr_prefill128_pp": pr["prefill128_pp"],
+        "main_prefill128_pp": main["prefill128_pp"],
+        "prefill_delta_pct": prefill_delta_pct,
+        "prefill_regressed": prefill_label == "REJECT",
+        "prefill_speedup_vs_main": round(pr["prefill128_pp"] / main["prefill128_pp"], 3) if main.get("prefill128_pp") else 0,
         "pr_top1": pr_top1,
         "pr_kl": pr_kl,
         "pr_ppl_spark": pr.get("ppl_spark"),
@@ -915,6 +983,8 @@ def format_comment(commit: str, res: dict) -> str:
         "delta_pct": res.get("delta_pct"),
         "pr_decode_tps": res.get("pr_decode_tps"),
         "main_decode_tps": res.get("main_decode_tps"),
+        "pr_prefill128_pp": res.get("pr_prefill128_pp"),
+        "main_prefill128_pp": res.get("main_prefill128_pp"),
         "pass": res.get("pass"),
         "accuracy_ok": res.get("accuracy_ok"),
         "q36_guard_ok": res.get("q36_guard_ok"),
@@ -962,10 +1032,13 @@ def format_comment(commit: str, res: dict) -> str:
         f"{marker}\n## sparkinfer museglimmer auto-eval — `eval-museglimmer:{lab}`\n\n"
         f"| metric | value |\n|---|---|\n"
         f"| **label** | `eval-museglimmer:{lab}` |\n"
-        f"| scored at | 128-token decode (ctx=0), no prefill context |\n"
+        f"| scored at | 128-token decode (ctx=0) + 128-ctx prefill — shared regression floor, best of the two |\n"
         f"| PR decode tok/s | {res['pr_decode_tps']:.2f} |\n"
         f"| main decode tok/s | {res['main_decode_tps']:.2f} |\n"
-        f"| speedup vs main | **{res.get('speedup_vs_main', 0):.2f}×** ({res.get('delta_pct', 0):+.1f}%) |\n"
+        f"| decode speedup vs main | **{res.get('speedup_vs_main', 0):.2f}×** ({res.get('decode_delta_pct', 0):+.1f}%) |\n"
+        f"| PR prefill@128 pp tok/s | {res.get('pr_prefill128_pp', 0):.2f} |\n"
+        f"| main prefill@128 pp tok/s | {res.get('main_prefill128_pp', 0):.2f} |\n"
+        f"| prefill speedup vs main | **{res.get('prefill_speedup_vs_main', 0):.2f}×** ({res.get('prefill_delta_pct', 0):+.1f}%) |\n"
         f"{acc_row}"
         f"{main_acc_note}"
         f"{q36_row}"
@@ -973,11 +1046,14 @@ def format_comment(commit: str, res: dict) -> str:
         f"{polaris_row}"
         f"| commit | `{commit[:9]}` |\n\n"
         f"{res.get('reason') or ''}\n\n"
-        "<sub>Scored on the pinned eval box vs same-box `origin/main`, 128-token AR decode only "
-        "(no DFlash, no long-context, no prefill) — Muse Glimmer's narrow, deliberately strict "
-        "eval scope. This is informational, not a judgment on your PR: a `none` label just means "
-        "no measurable Muse Glimmer 128-decode speedup was found, which is expected and fine if "
-        "that isn't what your change is about — this bot never closes PRs. "
+        "<sub>Scored on the pinned eval box vs same-box `origin/main` — 128-token AR decode "
+        "(ctx=0) AND 128-ctx prefill throughput, from one model load; either dimension regressing "
+        "is a hard REJECT, but otherwise the reported label is the **better** of the two tiers — "
+        "a PR that improves just one, with the other flat, still earns credit for that "
+        "(no DFlash, no long-context beyond 128) — Muse Glimmer's narrow, deliberately "
+        "strict eval scope. This is informational, not a judgment on your PR: a `none` label just "
+        "means no measurable Muse Glimmer speedup was verified on either metric, which is expected "
+        "and fine if that isn't what your change is about. "
         "Correctness gated against a live llama.cpp reference on the same GGUF. Also gated on a "
         "Qwen3.6 no-regression guard (decode+prefill, ctx 0/512/4k/16k/32k, same box vs main) — "
         "Muse Glimmer PRs can touch code shared with other models. "
@@ -1105,6 +1181,8 @@ def upload_museglimmer_eval_log(repo, num, title, oid, res):
             "delta_pct": res.get("delta_pct"),
             "pr_decode_tps": res.get("pr_decode_tps"), "main_decode_tps": res.get("main_decode_tps"),
             "speedup_vs_main": res.get("speedup_vs_main"),
+            "pr_prefill128_pp": res.get("pr_prefill128_pp"), "main_prefill128_pp": res.get("main_prefill128_pp"),
+            "prefill_speedup_vs_main": res.get("prefill_speedup_vs_main"),
             "pr_top1": res.get("pr_top1"), "pr_kl": res.get("pr_kl"),
             "accuracy_ok": res.get("accuracy_ok"),
             "q36_guard_ok": res.get("q36_guard_ok"), "q36_guard_problems": res.get("q36_guard_problems"),
@@ -1155,7 +1233,8 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
     if not res.get("ok"):
         label = "REJECT"
     print(f"PR #{num}: eval-museglimmer:{label}  "
-          f"PR={res.get('pr_decode_tps')} main={res.get('main_decode_tps')} "
+          f"decode PR={res.get('pr_decode_tps')} main={res.get('main_decode_tps')}  "
+          f"prefill128 PR={res.get('pr_prefill128_pp')} main={res.get('main_prefill128_pp')}  "
           f"delta={res.get('delta_pct')}%  accuracy_ok={res.get('accuracy_ok')}  "
           f"q36_guard_ok={res.get('q36_guard_ok')}")
     if dry_run:
@@ -1181,6 +1260,8 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
             "delta_pct": res.get("delta_pct"),
             "pr_decode_tps": res.get("pr_decode_tps"),
             "main_decode_tps": res.get("main_decode_tps"),
+            "pr_prefill128_pp": res.get("pr_prefill128_pp"),
+            "main_prefill128_pp": res.get("main_prefill128_pp"),
             "pass": res.get("pass"),
             "accuracy_ok": res.get("accuracy_ok"),
             "q36_guard_ok": res.get("q36_guard_ok"),
@@ -1203,20 +1284,24 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
                 fail_clause = "and regressed the Qwen3.6 no-regression guard (decode/prefill on shared code)"
             elif not res.get("accuracy_ok"):
                 fail_clause = "and failed the accuracy gate"
+            elif res.get("prefill_regressed"):
+                fail_clause = "and regressed 128-ctx prefill throughput specifically"
+            elif res.get("decode_regressed"):
+                fail_clause = "(decode regression)"
             elif label == "none":
-                fail_clause = "with no verified improvement"
+                fail_clause = "with no verified improvement on both decode and prefill"
             else:
                 fail_clause = "(regression)"
             close_body = (
                 "<!-- sparkinfer-museglimmer-auto-close -->\n"
                 f"## Closed: sparkinfer museglimmer auto-eval — `eval-museglimmer:{label}`\n\n"
-                f"This PR's Muse Glimmer 128-decode speed measured **{res.get('delta_pct')}%** vs "
-                f"main, {fail_clause} "
+                f"This PR's Muse Glimmer 128-decode/prefill speed measured **{res.get('delta_pct')}%** "
+                f"vs main, {fail_clause} "
                 "— closing automatically. This bot evaluates every eligible PR in the repo "
-                "against Muse Glimmer's decode speed specifically, regardless of what the PR is "
-                "actually about — a close here isn't a judgment on the PR's purpose, just that it "
-                "didn't move this particular metric. Reopen (or open a fresh PR) if you have a fix "
-                "or a different approach."
+                "against Muse Glimmer's decode AND prefill@128 speed specifically, regardless of "
+                "what the PR is actually about — a close here isn't a judgment on the PR's purpose, "
+                "just that it didn't move these particular metrics. Reopen (or open a fresh PR) if "
+                "you have a fix or a different approach."
             )
             arb.gh(["pr", "comment", str(num), "-R", repo, "--body", close_body])
             arb.gh(["pr", "close", str(num), "-R", repo])
@@ -1328,6 +1413,7 @@ def main():
         print("done — museglimmer round skipped (main baseline unusable).")
         return
     print(f">> main baseline: decode={main_result['decode_tps']:.2f} "
+          f"prefill128={main_result['prefill128_pp']:.2f} "
           f"top1={main_result.get('top1', 0):.3f} kl={main_result.get('kl', 99):.4f}")
 
     for num, head, short, ref, title in pending:
