@@ -835,6 +835,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                     // Group the retained native prefill weights; decode-only Q3_A buffers are not
                     // supported by this fused Q4_K/Q5_K prefill kernel.
                     bool ffn_grouped = false;
+                    // Set by the grouped launcher when it folded the SwiGLU + int8 quantize into
+                    // its split-K epilogue, so gate/up were never written out as bf16.
+                    int ffn_fused_swiglu = 0;
                     if (muse_ffn_group && muse_qb && use_i8 && w.gate_rs && w.up_rs &&
                         gate_pf_type == up_pf_type &&
                         kernels::pfm_moe_gemm_qi8_supported(gate_pf_type)) {
@@ -843,9 +846,15 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                         void*        Cf[2]  = { ffg, ffu };
                         const int    nf[2]  = { ffn, ffn };
                         quant_a_i8(hn_c, fn, H);
+                        // A_i8/sx are handed in as the fused SwiGLU's OUTPUT as well as the GEMM's
+                        // input: the GEMM has completed in stream order before the epilogue runs, and
+                        // each epilogue block reads sx for its own row into a register before writing
+                        // it back, so the aliasing is safe -- and it is exactly what the unfused
+                        // launch_prefill_swiglu_quant_i8 call below already does.
                         ffn_grouped = kernels::launch_prefill_gemm_qi8_dense_group(
                             gate_pf_type, A_i8, sx, Wf, rsf, Cf, nf, 2, fn, H, st,
-                            qb_partials, QB_SPLITS, qb_partials_cap);
+                            qb_partials, QB_SPLITS, qb_partials_cap,
+                            A_i8, sx, &ffn_fused_swiglu);
                     }
                     if (!ffn_grouped) {
                         proj_fused(hn_c, gate_pf, gate_pf_type, w.gate_rs, ffg, ffn, H, fn);
@@ -856,7 +865,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                         // runs (bit-identical to swiglu-then-quantize; both bf16-round first) --
                         // skips the ffg store + reload that proj()'s internal quantize would pay.
                         a_q = nullptr;                 // swiglu_quant writes A_i8/sx directly
-                        kernels::launch_prefill_swiglu_quant_i8(ffg, ffu, A_i8, sx, fn, ffn, st);
+                        if (!ffn_fused_swiglu)
+                            kernels::launch_prefill_swiglu_quant_i8(ffg, ffu, A_i8, sx, fn, ffn, st);
                         // Fused quantized-B down projection. The activation is ALREADY in A_i8/sx
                         // (the fused SwiGLU wrote it), so this cannot go through proj_fused, which
                         // would re-quantize -- call the dense fused GEMM directly. Only the

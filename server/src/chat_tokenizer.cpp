@@ -517,6 +517,22 @@ ThinkingStreamSplitter::Delta ThinkingStreamSplitter::feed(const std::string& pi
     carry_.clear();
 
     if (!enable_thinking_) {
+        // marker_prefix_len only ever returns up to strlen(kImEnd)-1 (see its own comment): it
+        // detects an INCOMPLETE marker straddling this chunk and the next, to hold back and
+        // wait -- it structurally cannot recognize "the complete marker just arrived", since
+        // that's a same-chunk match, not a partial-suffix one. <|im_end|> is usually decoded
+        // whole in a single piece (it's the terminal token), so that "complete, same-chunk"
+        // case is the COMMON one, not an edge case -- every time it hit, the whole 10-byte
+        // marker sailed straight into out.content since nothing here ever searched for a full
+        // match, only a partial one. strip_trailing_im_end() exists specifically for this
+        // string but only ran in finish(), long after a streaming client had already rendered
+        // it. Search for the complete marker first and drop it (and never emit anything after
+        // it -- it's the terminal marker) before falling back to the partial-suffix holdback.
+        const size_t im_end_pos = data.find(kImEnd);
+        if (im_end_pos != std::string::npos) {
+            if (im_end_pos > 0) out.content += data.substr(0, im_end_pos);
+            return out;
+        }
         const size_t keep = marker_prefix_len(data, kImEnd);
         const size_t emit_len = data.size() - keep;
         if (emit_len > 0) out.content += data.substr(0, emit_len);
@@ -558,6 +574,14 @@ ThinkingStreamSplitter::Delta ThinkingStreamSplitter::feed(const std::string& pi
 
         if (phase_ == Phase::kInAnswer) {
             std::string chunk = filter_answer_chunk(carry_, data);
+            // Same fix as the !enable_thinking_ path above: a complete <|im_end|> arriving
+            // whole in `chunk` (the common case) was never matched by marker_prefix_len's
+            // partial-suffix-only check, so it sailed straight into out.content.
+            const size_t im_end_pos = chunk.find(kImEnd);
+            if (im_end_pos != std::string::npos) {
+                if (im_end_pos > 0) out.content += chunk.substr(0, im_end_pos);
+                break;
+            }
             const size_t keep = marker_prefix_len(chunk, kImEnd);
             if (keep > 0 && keep == chunk.size()) {
                 carry_ = chunk;
