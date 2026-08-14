@@ -3981,18 +3981,23 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             }
         }
     }
-    // Optional native Blackwell FP4 copies for Muse's gate/up projections. This is eager
+    // Native Blackwell FP4 copies for Muse's dense FFN projections. This is eager
     // because scored prefill times the first pass. Gate/up native prefill copies that are distinct
     // from their compact Q3_A decode weights are released after conversion, keeping peak resident
-    // memory within a 32-GB card. The normal GGUF pointers remain the correctness fallback.
+    // memory within a 32-GB card. Supported SM120 builds enable gate/up and down automatically;
+    // either stage can be explicitly disabled for diagnostics. The normal GGUF pointers remain
+    // the correctness fallback.
     const char* fp4_env = getenv("SPARKINFER_MUSE_PREFILL_NVFP4");
-    if (c.muse_glimmer && fp4_env && fp4_env[0] == '1' &&
+    const char* fp4_down_env = getenv("SPARKINFER_MUSE_PREFILL_NVFP4_DOWN");
+    const bool want_fp4 = !fp4_env || fp4_env[0] != '0';
+    const bool want_fp4_down = !fp4_down_env || fp4_down_env[0] != '0';
+    if (c.muse_glimmer && want_fp4 &&
         kernels::prefill_nvfp4_supported(128, c.moe_ffn, H) &&
         kernels::prefill_nvfp4_supported(128, H, c.moe_ffn)) {
         void* tmp = nullptr;
         const size_t tmp_elems = (size_t)c.moe_ffn * H;
         bool ok = cudaMalloc(&tmp, tmp_elems * sizeof(bf16)) == cudaSuccess;
-        int ready = 0;
+        int ready = 0, down_ready = 0;
         auto convert = [&](const void* src, int qtype, int rows, int cols,
                            const void** data, const void** sf) -> bool {
             void *d = nullptr, *scale = nullptr;
@@ -4027,11 +4032,19 @@ bool Qwen35Model::load_gguf(const std::string& path) {
                 release_prefill_copy(lw.prefill_gate_q, lw.gate_q);
                 release_prefill_copy(lw.prefill_up_q, lw.up_q);
                 ++ready;
+                if (want_fp4_down &&
+                    convert(lw.down_q, lw.down_qtype, H, c.moe_ffn,
+                            &lw.down_fp4, &lw.down_fp4_sf))
+                    ++down_ready;
             }
         }
         if (tmp) cudaFree(tmp);
         fprintf(stderr, "[prefill-muse] SM120 NVFP4 FFN weights ready: %d/%d layers%s\n",
                 ready, c.n_layers, ok ? "" : " (remaining layers use GGUF fallback)");
+        if (want_fp4_down)
+            fprintf(stderr, "[prefill-muse] SM120 NVFP4 down weights ready: %d/%d layers%s\n",
+                    down_ready, c.n_layers,
+                    down_ready == c.n_layers ? "" : " (remaining layers use GGUF fallback)");
     }
     // decode scratch (mf_* / fa_*) is allocated in the constructor for all paths.
     return true;

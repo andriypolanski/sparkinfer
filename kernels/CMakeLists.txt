@@ -18,7 +18,17 @@ option(BUILD_BENCHMARKS    "Build benchmarks"            OFF)
 # tensor-core paths. OFF by default; the portable CUDA path below is the
 # production build and is what runs on RTX 5090 (sm_120).
 option(BUILD_CUTE_KERNELS  "Experimental CuTe DSL kernels (needs CUTLASS)" OFF)
-option(BUILD_NVFP4_KERNELS "Experimental SM120 native NVFP4 dense kernels" OFF)
+# Native NVFP4 is part of the production RTX 5090 build. Keep it disabled when
+# either the toolkit or requested architecture cannot compile sm_120a, so the
+# portable stubs remain the default on unsupported configurations.
+set(_SPARKINFER_NVFP4_DEFAULT OFF)
+if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8 AND
+   CMAKE_CUDA_ARCHITECTURES MATCHES "(^|;)120(a)?(;|$)")
+  set(_SPARKINFER_NVFP4_DEFAULT ON)
+endif()
+option(BUILD_NVFP4_KERNELS "SM120 native NVFP4 dense kernels"
+       ${_SPARKINFER_NVFP4_DEFAULT})
+unset(_SPARKINFER_NVFP4_DEFAULT)
 
 include_directories(include)
 

@@ -84,6 +84,9 @@ struct Qwen35LayerWeights {
     // unsupported shapes continue to use the GGUF-native pointers above.
     const void* gate_fp4 = nullptr; const void* gate_fp4_sf = nullptr;
     const void* up_fp4 = nullptr;   const void* up_fp4_sf = nullptr;
+    // Optional second-stage copy for the experimental all-FP4 FFN path. Kept separate
+    // from down_q because decode still consumes the native GGUF weight.
+    const void* down_fp4 = nullptr; const void* down_fp4_sf = nullptr;
     // attention projections: 0 = bf16 dense (default); else ggml type id (12=Q4_K,
     // 14=Q6_K) -> weights kept quantized in VRAM, decoded on-read by launch_gemv_q.
     int wq_type = 0, wgate_type = 0, wk_type = 0, wv_type = 0, wo_type = 0;
