@@ -22,6 +22,7 @@
 #include "sparkinfer/kernels/prefill_moe.h"
 #include "sparkinfer/kernels/prefill_router_mma.h"
 #include "sparkinfer/kernels/prefill_moe_q.h"
+#include "sparkinfer/kernels/prefill_nvfp4.h"
 #include "sparkinfer/kernels/moe.h"
 #include "sparkinfer/kernels/attention.h"
 #include "sparkinfer/models/dflash_kernels.h"
@@ -364,6 +365,22 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     }
     // Every split-K use is gated on this, so a non-Muse model never reaches the new kernel.
     const bool mg_sk = sk_p != nullptr;
+
+    // Native block-scaled FP4 is deliberately narrow: Muse, the scored M=128 shape, and layers
+    // whose eager conversion completed. One activation buffer is shared by gate/up. Down stays on
+    // the higher-fidelity #808 quantized path because its error enters the residual directly.
+    const bool muse_nvfp4 = c.muse_glimmer && N == 128 && !s.w.layers.empty() &&
+                            s.w.layers[0].gate_fp4 &&
+                            kernels::prefill_nvfp4_supported(N, ffn, H);
+    const size_t fp4_a_data_bytes = muse_nvfp4
+        ? kernels::prefill_nvfp4_data_bytes(N, H) : 0;
+    const size_t fp4_a_sf_bytes = muse_nvfp4
+        ? kernels::prefill_nvfp4_scale_bytes_a(N, H) : 0;
+    const size_t fp4_ws_bytes = muse_nvfp4
+        ? kernels::prefill_nvfp4_workspace_bytes(N, ffn, H) : 0;
+    unsigned char* fp4_a = muse_nvfp4 ? a8.alloc<unsigned char>(fp4_a_data_bytes) : nullptr;
+    unsigned char* fp4_as = muse_nvfp4 ? a8.alloc<unsigned char>(fp4_a_sf_bytes) : nullptr;
+    unsigned char* fp4_ws = muse_nvfp4 ? a8.alloc<unsigned char>(fp4_ws_bytes) : nullptr;
 
     // Long-ctx FFN int8: keep gate/up/down int8 weights (+scales) across token chunks so each
     // layer dequants once instead of once per chunk. ~150 MB vs ~300 MB for a bf16 cache.
@@ -946,6 +963,19 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             for (int fo = 0; fo < N; fo += FC) {
                 const int fn = (N - fo < FC) ? (N - fo) : FC;
                 const bf16* hn_c = hn + (size_t)fo * H;
+                const bool layer_fp4 = muse_nvfp4 && fn == 128 && w.gate_fp4 && w.gate_fp4_sf &&
+                    w.up_fp4 && w.up_fp4_sf && fp4_a && fp4_as &&
+                    kernels::launch_prefill_nvfp4_quant_a(hn_c, fp4_a, fp4_as, fn, H, st) &&
+                    kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_as, w.gate_fp4, w.gate_fp4_sf,
+                                                       ffg, fn, ffn, H, fp4_ws, st) &&
+                    kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_as, w.up_fp4, w.up_fp4_sf,
+                                                       ffu, fn, ffn, H, fp4_ws, st);
+                if (layer_fp4) {
+                    kernels::launch_prefill_swiglu(ffg, ffu, ffg, (long)fn * ffn, st);
+                    proj_fused_acc(ffg, w.down_q, w.down_qtype, w.down_rs,
+                                   ao + (size_t)fo * H, H, ffn, &ffn_acc, fn);
+                    continue;
+                }
                 if (ffn_i8) {
                     a_q = nullptr;                     // this branch writes A_i8/sx directly
                     a_pk = kernels::launch_prefill_quantize_rows_i8(hn_c, A_i8, sx, fn, H, st,

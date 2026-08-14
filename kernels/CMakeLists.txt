@@ -18,6 +18,7 @@ option(BUILD_BENCHMARKS    "Build benchmarks"            OFF)
 # tensor-core paths. OFF by default; the portable CUDA path below is the
 # production build and is what runs on RTX 5090 (sm_120).
 option(BUILD_CUTE_KERNELS  "Experimental CuTe DSL kernels (needs CUTLASS)" OFF)
+option(BUILD_NVFP4_KERNELS "Experimental SM120 native NVFP4 dense kernels" OFF)
 
 include_directories(include)
 
@@ -38,16 +39,30 @@ if(MSVC)
 endif()
 
 # --- Optional CuTe DSL kernel domains (experimental, sm_100a/sm_120a) ---
-if(BUILD_CUTE_KERNELS)
+if(BUILD_CUTE_KERNELS OR BUILD_NVFP4_KERNELS)
     include(FetchContent)
+    set(CUTLASS_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
+    set(CUTLASS_ENABLE_TOOLS OFF CACHE BOOL "" FORCE)
+    set(CUTLASS_ENABLE_EXAMPLES OFF CACHE BOOL "" FORCE)
     FetchContent_Declare(cutlass
         GIT_REPOSITORY https://github.com/NVIDIA/cutlass.git
-        GIT_TAG        main
+        GIT_TAG        v4.7.0
         GIT_SHALLOW    TRUE)
     FetchContent_MakeAvailable(cutlass)
+endif()
+
+if(BUILD_CUTE_KERNELS)
     add_subdirectory(csrc/cute/moe_swiglu)
     add_subdirectory(csrc/cute/moe_gemm)
     list(APPEND SPARKINFER_KERNEL_LIBS si_cute_moe_swiglu si_cute_moe_gemm)
+endif()
+
+if(BUILD_NVFP4_KERNELS)
+    target_sources(si_fused PRIVATE csrc/cuda/fused/prefill_nvfp4_sm120.cu)
+    target_include_directories(si_fused PRIVATE ${cutlass_SOURCE_DIR}/include ${cutlass_SOURCE_DIR}/tools/util/include)
+    target_compile_definitions(si_fused PRIVATE SPARKINFER_BUILD_NVFP4=1)
+    target_compile_options(si_fused PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+    set_target_properties(si_fused PROPERTIES CUDA_ARCHITECTURES "120a")
 endif()
 
 # Unified interface library

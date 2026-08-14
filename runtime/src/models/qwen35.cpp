@@ -22,6 +22,7 @@
 #include "sparkinfer/kernels/moe.h"
 #include "sparkinfer/kernels/quant.h"
 #include "sparkinfer/kernels/proj_requant.h"
+#include "sparkinfer/kernels/prefill_nvfp4.h"
 #include "sparkinfer/lmcache_bridge_client.h"
 #include "sparkinfer/lmcache_staging.h"
 
@@ -3898,6 +3899,58 @@ bool Qwen35Model::load_gguf(const std::string& path) {
                         (double)(total * sizeof(float)) / (1024.0 * 1024.0));
             }
         }
+    }
+    // Optional native Blackwell FP4 copies for Muse's gate/up projections. This is eager
+    // because scored prefill times the first pass. Gate/up native prefill copies that are distinct
+    // from their compact Q3_A decode weights are released after conversion, keeping peak resident
+    // memory within a 32-GB card. The normal GGUF pointers remain the correctness fallback.
+    const char* fp4_env = getenv("SPARKINFER_MUSE_PREFILL_NVFP4");
+    if (c.muse_glimmer && fp4_env && fp4_env[0] == '1' &&
+        kernels::prefill_nvfp4_supported(128, c.moe_ffn, H) &&
+        kernels::prefill_nvfp4_supported(128, H, c.moe_ffn)) {
+        void* tmp = nullptr;
+        const size_t tmp_elems = (size_t)c.moe_ffn * H;
+        bool ok = cudaMalloc(&tmp, tmp_elems * sizeof(bf16)) == cudaSuccess;
+        int ready = 0;
+        auto convert = [&](const void* src, int qtype, int rows, int cols,
+                           const void** data, const void** sf) -> bool {
+            void *d = nullptr, *scale = nullptr;
+            if (!src || cudaMalloc(&d, kernels::prefill_nvfp4_data_bytes(rows, cols)) != cudaSuccess)
+                return false;
+            if (cudaMalloc(&scale, kernels::prefill_nvfp4_scale_bytes_b(rows, cols)) != cudaSuccess) {
+                cudaFree(d); return false;
+            }
+            kernels::launch_gguf_dequant(qtype, src, tmp, (long)rows * cols, s.stream);
+            if (!kernels::launch_prefill_nvfp4_quant_b(tmp, d, scale, rows, cols, s.stream) ||
+                cudaStreamSynchronize(s.stream) != cudaSuccess) {
+                cudaFree(d); cudaFree(scale); return false;
+            }
+            s.owned.push_back(d); s.owned.push_back(scale); *data = d; *sf = scale;
+            return true;
+        };
+        auto release_prefill_copy = [&](const void*& p, const void* decode) {
+            if (!p || p == decode) return;
+            auto it = std::find(s.owned.begin(), s.owned.end(), const_cast<void*>(p));
+            if (it != s.owned.end()) { cudaFree(*it); s.owned.erase(it); }
+            p = nullptr;
+        };
+        for (int i = 0; ok && i < c.n_layers; ++i) {
+            Qwen35LayerWeights& lw = s.w.layers[i];
+            const void* g = lw.prefill_gate_q ? lw.prefill_gate_q : lw.gate_q;
+            const void* u = lw.prefill_up_q ? lw.prefill_up_q : lw.up_q;
+            const int gt = lw.prefill_gate_q ? lw.prefill_gate_qtype : lw.gate_qtype;
+            const int ut = lw.prefill_up_q ? lw.prefill_up_qtype : lw.up_qtype;
+            ok = convert(g, gt, c.moe_ffn, H, &lw.gate_fp4, &lw.gate_fp4_sf) &&
+                 convert(u, ut, c.moe_ffn, H, &lw.up_fp4, &lw.up_fp4_sf);
+            if (ok) {
+                release_prefill_copy(lw.prefill_gate_q, lw.gate_q);
+                release_prefill_copy(lw.prefill_up_q, lw.up_q);
+                ++ready;
+            }
+        }
+        if (tmp) cudaFree(tmp);
+        fprintf(stderr, "[prefill-muse] SM120 NVFP4 FFN weights ready: %d/%d layers%s\n",
+                ready, c.n_layers, ok ? "" : " (remaining layers use GGUF fallback)");
     }
     // decode scratch (mf_* / fa_*) is allocated in the constructor for all paths.
     return true;
