@@ -192,6 +192,29 @@ void launch_presence_frequency_penalty(float* logits, const int* counts, int voc
 // Call AFTER launch_argmax, alongside launch_extract_chosen_logit.
 void launch_increment_penalty_count(int* counts, const int* out_id, cudaStream_t stream = nullptr);
 
+// logits[v] += bias[v] for every vocab entry -- always launched unconditionally on the CUDA-graph-
+// captured decode path, same graph-replay-safety rationale as launch_presence_frequency_penalty.
+// Unlike that kernel's counts (refreshed every decode step), `bias` is set ONCE per request by
+// launch_scatter_logit_bias below (called outside this graph, from Qwen35Model::set_logit_bias)
+// and stays constant for the rest of the request's decode -- no per-step host round-trip needed.
+// logit_bias has no inertness proof at temperature<=0 (an arbitrary per-vocab additive bias CAN
+// change the greedy-argmax winner on its own), same story as presence/frequency penalty -- see
+// should_reject_dflash_logit_bias in chat_tools.hpp.
+//
+// Call alongside launch_presence_frequency_penalty, BEFORE launch_topk_topp_mask (order between
+// the two additive kernels doesn't matter mathematically) so the biased distribution flows through
+// truncation, temperature sampling, AND logprobs reporting.
+void launch_logit_bias(float* logits, const float* bias, int vocab, cudaStream_t stream = nullptr);
+
+// bias[ids[i]] = vals[i] for i in [0,k) -- a one-time host-triggered scatter, NOT part of the
+// captured decode graph (call from Qwen35Model::set_logit_bias, before the request's first
+// forward_token()). ids/vals are small (k <= kMaxLogitBiasEntries) transient scratch, distinct
+// from the persistent per-session `bias` buffer launch_logit_bias reads every decode step. An
+// out-of-range id is silently dropped (defensive backstop; real validation is
+// parse_request_controls, which has the real vocab size).
+void launch_scatter_logit_bias(float* bias, const int* ids, const float* vals, int k, int vocab,
+                               cudaStream_t stream = nullptr);
+
 // Load-time-only helpers (no kernel launch involved beyond a one-time iota fill) -- call once per
 // model load, never on the decode hot path.
 size_t topk_sort_temp_storage_bytes(int vocab);

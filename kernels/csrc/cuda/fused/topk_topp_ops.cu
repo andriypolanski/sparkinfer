@@ -113,6 +113,34 @@ __global__ void increment_penalty_count_kernel(int* __restrict__ counts, const i
     if (threadIdx.x == 0 && blockIdx.x == 0) counts[*out_id] += 1;
 }
 
+// logit_bias[v] += bias -- always launched unconditionally on the CUDA-graph-captured decode path,
+// same rationale as apply_presence_frequency_penalty_kernel: the graph may replay for a LATER,
+// different request via use_prefix_session's shared seq_id=0, so this must read whatever is
+// CURRENTLY in the fixed-address `bias` buffer rather than being host-gated on this call's own
+// request. Unlike presence/frequency penalty, `bias` is not refreshed every decode step -- it is
+// set ONCE per request (Qwen35Model::set_logit_bias, outside this graph) via
+// scatter_logit_bias_kernel below, then stays constant for the rest of the request's decode. At
+// logit_bias unset, `bias` is all-zero and this is a pure add-zero pass -- same always-on cost
+// story as the penalty kernel.
+__global__ void apply_logit_bias_kernel(float* __restrict__ logits, const float* __restrict__ bias,
+                                        int vocab) {
+    for (int v = blockIdx.x * blockDim.x + threadIdx.x; v < vocab; v += gridDim.x * blockDim.x)
+        logits[v] += bias[v];
+}
+
+// bias[ids[i]] = vals[i] for i in [0,k) -- NOT part of the captured decode graph; called once per
+// request from Qwen35Model::set_logit_bias, before the request's first forward_token(). The bound
+// check is a defensive backstop (the real validation is parse_request_controls, which has access
+// to the real vocab size); an out-of-range id here is silently dropped rather than corrupting
+// adjacent device memory.
+__global__ void scatter_logit_bias_kernel(float* __restrict__ bias, const int* __restrict__ ids,
+                                          const float* __restrict__ vals, int k, int vocab) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < k; i += gridDim.x * blockDim.x) {
+        const int id = ids[i];
+        if (id >= 0 && id < vocab) bias[id] = vals[i];
+    }
+}
+
 }  // namespace
 
 size_t topk_sort_temp_storage_bytes(int vocab) {
@@ -175,6 +203,18 @@ void launch_presence_frequency_penalty(float* logits, const int* counts, int voc
 
 void launch_increment_penalty_count(int* counts, const int* out_id, cudaStream_t stream) {
     increment_penalty_count_kernel<<<1, 1, 0, stream>>>(counts, out_id);
+}
+
+void launch_logit_bias(float* logits, const float* bias, int vocab, cudaStream_t stream) {
+    const int bx = (vocab + 255) / 256 > 1024 ? 1024 : (vocab + 255) / 256;
+    apply_logit_bias_kernel<<<bx < 1 ? 1 : bx, 256, 0, stream>>>(logits, bias, vocab);
+}
+
+void launch_scatter_logit_bias(float* bias, const int* ids, const float* vals, int k, int vocab,
+                               cudaStream_t stream) {
+    if (k <= 0) return;
+    const int bx = (k + 255) / 256 > 1024 ? 1024 : (k + 255) / 256;
+    scatter_logit_bias_kernel<<<bx < 1 ? 1 : bx, 256, 0, stream>>>(bias, ids, vals, k, vocab);
 }
 
 }  // namespace kernels

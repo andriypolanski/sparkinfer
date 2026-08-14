@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace sparkinfer_server {
@@ -97,9 +98,20 @@ struct RequestControls {
     // logprobs=true (matches OpenAI's own documented constraint).
     bool logprobs = false;
     int top_logprobs = 0;   // 0-20 when logprobs=true
+    // OpenAI's logit_bias: (token_id, bias) pairs, bias in [-100.0, 100.0]. Empty (default)
+    // disables it -- same self-describing-default convention as top_p/top_k, no `_set` bool
+    // needed. Sampling-control tier, same as presence_penalty/frequency_penalty -- threaded
+    // through every complete_streaming call site, including the json_mode/tool-calling retry
+    // loops.
+    std::vector<std::pair<int, float>> logit_bias;
 };
 
-bool parse_request_controls(const std::string& body, RequestControls& out, std::string& err);
+// vocab, when > 0, additionally rejects any logit_bias token id >= vocab with a real validation
+// error (400) instead of silently letting it through -- 0 (the default) skips that upper-bound
+// check, so existing callers that don't have a vocab size handy are unaffected. Negative token
+// ids and malformed keys are always rejected regardless of vocab.
+bool parse_request_controls(const std::string& body, RequestControls& out, std::string& err,
+                            int vocab = 0);
 
 // Pure decision function for the DFlash+temperature-sampling incompatibility (kept separate from
 // getenv() so it's unit-testable without a process-wide env var): true => the request should be
@@ -112,6 +124,13 @@ bool should_reject_dflash_temperature(bool dflash_env_on, float temperature);
 // the greedy-argmax winner on its own. true => the request should be rejected with 400.
 // presence_penalty==0 && frequency_penalty==0 is always accepted regardless of dflash_env_on.
 bool should_reject_dflash_penalty(bool dflash_env_on, float presence_penalty, float frequency_penalty);
+
+// Pure decision function for the DFlash+logit_bias incompatibility -- mirrors
+// should_reject_dflash_penalty; logit_bias has the same "no inertness proof at temperature<=0" gap
+// (an arbitrary per-vocab additive bias CAN change the greedy-argmax winner on its own). true =>
+// the request should be rejected with 400. An empty logit_bias is always accepted regardless of
+// dflash_env_on.
+bool should_reject_dflash_logit_bias(bool dflash_env_on, bool has_logit_bias);
 
 // Best-effort validation only -- there is no constrained decoding in this backend, so this
 // cannot guarantee the model's output actually conforms; it just checks after the fact.

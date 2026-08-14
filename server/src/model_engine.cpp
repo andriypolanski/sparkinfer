@@ -368,6 +368,7 @@ CompletionResult ModelEngine::complete_streaming(const std::vector<int>& prompt_
                                                  float temperature, uint64_t seed,
                                                  int top_k, float top_p,
                                                  float presence_penalty, float frequency_penalty,
+                                                 const std::vector<std::pair<int, float>>& logit_bias,
                                                  bool logprobs, int top_logprobs,
                                                  const std::function<void(const TokenLogprob&)>&
                                                      on_token_logprob) {
@@ -381,6 +382,7 @@ CompletionResult ModelEngine::complete_streaming(const std::vector<int>& prompt_
     req.top_p = top_p;
     req.presence_penalty = presence_penalty;
     req.frequency_penalty = frequency_penalty;
+    req.logit_bias = logit_bias;
     req.logprobs = logprobs;
     req.top_logprobs = top_logprobs;
 

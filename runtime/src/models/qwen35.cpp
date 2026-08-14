@@ -61,6 +61,10 @@ using bf16 = unsigned short;
 // token id, so it cannot be confused with a real argmax.
 constexpr int kDFlashDeferred = INT_MIN;
 
+// Qwen35Model::set_logit_bias's sparse (id,val) scratch cap -- sparkinfer's own implementation
+// bound for scratch-buffer sizing, NOT an OpenAI-documented limit.
+constexpr int kMaxLogitBiasEntries = 1024;
+
 // launch_gguf_dequant only implements F32/F16/Q8_0/Q4_K/Q6_K. Reject anything
 // else at load time so Q5_K (etc.) cannot silently fall through as F32.
 bool ggml_dequant_supported(int ggml_type) {
@@ -131,6 +135,12 @@ struct SessionBuffers {
     // explicitly re-zeroed once per REQUEST (not just once per session-slot creation) whenever a
     // session is reused across multiple requests (seq_id 0, the shared prefix session).
     int* penalty_counts = nullptr;
+    // Per-request static per-vocab-id additive bias for logit_bias -- unlike penalty_counts (which
+    // starts at zero and is incremented device-side every decode step), this is SET ONCE per
+    // request (Qwen35Model::set_logit_bias) and stays constant for the rest of the request's
+    // decode. Exists for EVERY model, same as penalty_counts, and needs the identical per-REQUEST
+    // (not per-session-slot) re-zero-then-set discipline when a session is reused (seq_id 0).
+    float* logit_bias = nullptr;
 };
 
 struct Qwen35Model::Impl {
@@ -187,6 +197,15 @@ struct Qwen35Model::Impl {
     // open_session().
     int* penalty_counts = nullptr;
     int* penalty_counts_default = nullptr;
+    // "Current" session's logit_bias (swapped by activate_session(), unconditionally, for every
+    // model -- mirrors penalty_counts exactly). logit_bias_default backs session 0's entry.
+    float* logit_bias = nullptr;
+    float* logit_bias_default = nullptr;
+    // Transient scratch for Qwen35Model::set_logit_bias's sparse (id,val) -> device scatter. NOT
+    // session-scoped (purely transient staging, safe to share across requests since submit_locked
+    // -- the only caller -- always runs with the engine mutex held). Fixed size (kMaxLogitBiasEntries).
+    int* h_logit_bias_ids = nullptr; float* h_logit_bias_vals = nullptr;
+    int* d_logit_bias_ids = nullptr; float* d_logit_bias_vals = nullptr;
     float* logits;
     int *d_scalars, *d_tok, *d_out_id, *d_pos, *d_seqlen, *d_writepos, *d_shared_ids;
     int *d_cap_row = nullptr;   // dflash capture row, packed into d_scalars[4]
@@ -393,6 +412,18 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
     p_->penalty_counts=p_->penalty_counts_default;
     cu(cudaMemsetAsync(p_->penalty_counts_default, 0, (size_t)cfg.vocab * sizeof(int), p_->stream),
        "penalty_counts_default zero");
+    // logit_bias per-vocab additive bias, session-0's own buffer -- mirrors penalty_counts_default
+    // exactly (unconditional, every model).
+    p_->logit_bias_default=p_->alloc<float>(cfg.vocab);
+    p_->logit_bias=p_->logit_bias_default;
+    cu(cudaMemsetAsync(p_->logit_bias_default, 0, (size_t)cfg.vocab * sizeof(float), p_->stream),
+       "logit_bias_default zero");
+    p_->d_logit_bias_ids=p_->alloc<int>(kMaxLogitBiasEntries);
+    p_->d_logit_bias_vals=p_->alloc<float>(kMaxLogitBiasEntries);
+    cu(cudaHostAlloc(&p_->h_logit_bias_ids, kMaxLogitBiasEntries * sizeof(int), cudaHostAllocDefault),
+       "host logit_bias ids");
+    cu(cudaHostAlloc(&p_->h_logit_bias_vals, kMaxLogitBiasEntries * sizeof(float), cudaHostAllocDefault),
+       "host logit_bias vals");
     p_->d_scalars=p_->alloc<int>(5);
     p_->d_tok=p_->d_scalars + 0; p_->d_pos=p_->d_scalars + 1;
     p_->d_writepos=p_->d_scalars + 2; p_->d_seqlen=p_->d_scalars + 3;
@@ -550,6 +581,7 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
             d.lin_conv_state = p_->lin_conv_state;
         }
         d.penalty_counts = p_->penalty_counts_default;   // unconditional -- every model
+        d.logit_bias = p_->logit_bias_default;           // unconditional -- every model
         p_->sessions[0] = d;
     }
 }
@@ -560,6 +592,9 @@ Qwen35Model::~Qwen35Model() {
     cudaFree(p_->attn); cudaFree(p_->ao); cudaFree(p_->h); cudaFree(p_->hn);
     cudaFree(p_->routed); cudaFree(p_->shared); cudaFree(p_->logits);
     cudaFree(p_->penalty_counts_default);
+    cudaFree(p_->logit_bias_default);
+    cudaFree(p_->d_logit_bias_ids); cudaFree(p_->d_logit_bias_vals);
+    cudaFreeHost(p_->h_logit_bias_ids); cudaFreeHost(p_->h_logit_bias_vals);
     // main's packed decode scalars (d_tok/d_pos/d_seqlen/d_writepos alias into d_scalars — not freed separately)
     cudaFree(p_->d_scalars); cudaFree(p_->d_out_id);
     cudaFreeHost(p_->h_scalars); cudaFreeHost(p_->h_out_id);
@@ -1819,6 +1854,13 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
     if (c.muse_glimmer && c.final_logit_softcapping > 0.f)
         kernels::launch_logit_softcap(s.logits, 1, c.vocab, c.logit_scale, c.final_logit_softcapping, st);
     dbg_f32(s.logits, c.vocab, 91, -2);   // tag 91: final logits (post logit_scale/softcap)
+    // Always launched, never host-gated: logit_bias has NO inertness proof at temperature<=0 (an
+    // arbitrary per-vocab additive bias CAN change the greedy-argmax winner on its own) -- see
+    // qwen35.h's forward_token doc comment. Reads whatever is CURRENTLY in s.logit_bias, set once
+    // per request by set_logit_bias (not refreshed here every decode step, unlike the scalar
+    // params below) -- correct because activate_session() swaps s.logit_bias to the request's own
+    // session buffer before any of this request's forward_token() calls run.
+    kernels::launch_logit_bias(s.logits, s.logit_bias, c.vocab, st);
     // Always launched, never host-gated: presence/frequency penalty has NO inertness proof at
     // presence_penalty==0 && frequency_penalty==0 the way top_k/top_p do at temperature<=0 -- see
     // qwen35.h's forward_token doc comment. Applied BEFORE launch_topk_topp_mask's sort so the
@@ -2359,7 +2401,8 @@ uint64_t Qwen35Model::open_session(int num_tokens, bool* alloc_failed) {
     // unlike session 0, which is reused across many DIFFERENT requests and needs an explicit
     // per-request reset (see reset_penalty_counts()).
     buf.penalty_counts = s.alloc<int>(s.cfg.vocab);
-    bool alloc_ok = buf.penalty_counts != nullptr;
+    buf.logit_bias = s.alloc<float>(s.cfg.vocab);
+    bool alloc_ok = buf.penalty_counts != nullptr && buf.logit_bias != nullptr;
     if (s.cfg.hybrid) {
         buf.lin_state = s.alloc<float>((size_t)s.cfg.n_layers * s.cfg.linear_v_heads *
                                        s.cfg.linear_head_dim * s.cfg.linear_head_dim);
@@ -2375,6 +2418,7 @@ uint64_t Qwen35Model::open_session(int num_tokens, bool* alloc_failed) {
         if (alloc_failed) *alloc_failed = true;
         s.kv->free(seq_id);
         if (buf.penalty_counts) cudaFree(buf.penalty_counts);
+        if (buf.logit_bias) cudaFree(buf.logit_bias);
         if (buf.lin_state) cudaFree(buf.lin_state);
         if (buf.lin_conv_state) cudaFree(buf.lin_conv_state);
         return 0;
@@ -2385,6 +2429,11 @@ uint64_t Qwen35Model::open_session(int num_tokens, bool* alloc_failed) {
     // nonzero penalty count would be silently, incorrectly wrong from token 1.
     cu(cudaMemsetAsync(buf.penalty_counts, 0, (size_t)s.cfg.vocab * sizeof(int), s.stream),
        "penalty_counts zero");
+    // logit_bias: same one-time-zero-is-sufficient reasoning as penalty_counts above (1:1 fresh-
+    // session lifecycle) -- the actual per-request VALUES are set later by set_logit_bias(), called
+    // from submit_locked() right after this open_session() returns.
+    cu(cudaMemsetAsync(buf.logit_bias, 0, (size_t)s.cfg.vocab * sizeof(float), s.stream),
+       "logit_bias zero");
     s.sessions[seq_id] = buf;
     return seq_id;
 }
@@ -2421,6 +2470,9 @@ void Qwen35Model::close_session(uint64_t seq_id, const std::vector<int>* store_t
         // The seq_id == 0 guard at the top of this function already protects
         // penalty_counts_default from ever being freed here, same aliasing-safety story as #779.
         if (it->second.penalty_counts) cudaFree(it->second.penalty_counts);
+        // Unconditional, every model -- mirrors penalty_counts's free exactly, same aliasing-safety
+        // story (the seq_id == 0 guard above already protects logit_bias_default).
+        if (it->second.logit_bias) cudaFree(it->second.logit_bias);
         s.sessions.erase(it);
     }
     if (s.active_seq_id == seq_id) activate_session(0);
@@ -2437,9 +2489,11 @@ void Qwen35Model::activate_session(uint64_t seq_id) {
             s.lin_state = it->second.lin_state;
             s.lin_conv_state = it->second.lin_conv_state;
         }
-        // penalty_counts swaps for EVERY model (hybrid or not) -- unlike lin_state/lin_conv_state
-        // above, this isn't architecture-specific, it's a per-request sampling-control accumulator.
+        // penalty_counts/logit_bias swap for EVERY model (hybrid or not) -- unlike lin_state/
+        // lin_conv_state above, these aren't architecture-specific, they're per-request sampling-
+        // control state.
         s.penalty_counts = it->second.penalty_counts;
+        s.logit_bias = it->second.logit_bias;
     }
     invalidate_decode_graph();
 }
@@ -2457,6 +2511,33 @@ void Qwen35Model::reset_penalty_counts(uint64_t seq_id) {
     if (it == s.sessions.end() || !it->second.penalty_counts) return;   // defensive; should not happen
     cu(cudaMemsetAsync(it->second.penalty_counts, 0, (size_t)s.cfg.vocab * sizeof(int), s.stream),
        "penalty_counts reset");
+}
+
+void Qwen35Model::set_logit_bias(uint64_t seq_id, const std::vector<std::pair<int, float>>& bias) {
+    Impl& s = *p_;
+    // Looked up via the sessions map directly, same "HTTP-facing thread, not the worker's currently
+    // active session" reasoning as reset_penalty_counts.
+    auto it = s.sessions.find(seq_id);
+    if (it == s.sessions.end() || !it->second.logit_bias) return;   // defensive; should not happen
+    // Unconditional zero first, even for an empty bias -- session 0 is reused across unrelated
+    // requests, so a request with no logit_bias must not inherit a PRIOR request's bias.
+    cu(cudaMemsetAsync(it->second.logit_bias, 0, (size_t)s.cfg.vocab * sizeof(float), s.stream),
+       "logit_bias reset");
+    if (bias.empty()) return;
+    const int k = (int)std::min<size_t>(bias.size(), (size_t)kMaxLogitBiasEntries);
+    for (int i = 0; i < k; i++) {
+        s.h_logit_bias_ids[i] = bias[i].first;
+        s.h_logit_bias_vals[i] = bias[i].second;
+    }
+    // Safe to share the Impl-level scratch (not session-scoped): submit_locked, the only caller, is
+    // always called with the engine mutex held, and the scatter launch below goes on s.stream (the
+    // model's single compute stream) -- fully serialized with any other in-flight set_logit_bias.
+    cu(cudaMemcpyAsync(s.d_logit_bias_ids, s.h_logit_bias_ids, k * sizeof(int),
+                       cudaMemcpyHostToDevice, s.stream), "logit_bias ids");
+    cu(cudaMemcpyAsync(s.d_logit_bias_vals, s.h_logit_bias_vals, k * sizeof(float),
+                       cudaMemcpyHostToDevice, s.stream), "logit_bias vals");
+    kernels::launch_scatter_logit_bias(it->second.logit_bias, s.d_logit_bias_ids, s.d_logit_bias_vals,
+                                       k, s.cfg.vocab, s.stream);
 }
 
 // Greedy-only: this and dflash_generate() are never called from sparkinfer_server (which drives

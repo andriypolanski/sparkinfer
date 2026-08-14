@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <cstdint>
 #include <initializer_list>
 #include <limits>
@@ -15,6 +16,11 @@ namespace sparkinfer_server {
 namespace {
 
 using json = nlohmann::json;
+
+// Must match runtime/src/models/qwen35.cpp's Impl::kMaxLogitBiasEntries -- that's the real
+// scratch-buffer cap a scatter can hold; this is where the request-facing 400 for exceeding it
+// lives, so the client learns about the limit instead of silently having extra entries dropped.
+constexpr int kMaxLogitBiasEntries = 1024;
 
 constexpr const char* kImStart = "<|im_start|>";
 constexpr const char* kImEnd = "<|im_end|>";
@@ -1037,7 +1043,8 @@ bool validate_response_format(const std::string& content, const ResponseFormat& 
     return validate_value(parsed, format.schema, "response", err);
 }
 
-bool parse_request_controls(const std::string& body, RequestControls& out, std::string& err) {
+bool parse_request_controls(const std::string& body, RequestControls& out, std::string& err,
+                            int vocab) {
     const auto root = json::parse(body, nullptr, false);
     if (root.is_discarded() || !root.is_object()) {
         err = "request body must be a JSON object";
@@ -1220,6 +1227,47 @@ bool parse_request_controls(const std::string& body, RequestControls& out, std::
         }
         out.top_logprobs = static_cast<int>(n);
     }
+    if (root.contains("logit_bias") && !root["logit_bias"].is_null()) {
+        const auto& value = root["logit_bias"];
+        if (!value.is_object()) {
+            err = "logit_bias must be an object";
+            return false;
+        }
+        if (value.size() > (size_t)kMaxLogitBiasEntries) {
+            err = "logit_bias supports at most " + std::to_string(kMaxLogitBiasEntries) + " entries";
+            return false;
+        }
+        std::vector<std::pair<int, float>> bias;
+        bias.reserve(value.size());
+        for (const auto& entry : value.items()) {
+            const std::string& key = entry.key();
+            const auto& v = entry.value();
+            if (!v.is_number()) {
+                err = "logit_bias values must be numbers";
+                return false;
+            }
+            const double b = v.get<double>();
+            if (!(b >= -100.0) || !(b <= 100.0)) {  // NaN-safe: comparisons against NaN are false either way
+                err = "logit_bias values must be between -100 and 100";
+                return false;
+            }
+            // Strict parse: the ENTIRE key must be a base-10 non-negative integer -- from_chars
+            // reports how far it got via `ptr`, so "12a"/"1.5"/" 12"/"" all fail the full-consumption
+            // check below (from_chars also rejects a leading '+' and whitespace on its own).
+            int id = 0;
+            const auto res = std::from_chars(key.data(), key.data() + key.size(), id);
+            if (res.ec != std::errc() || res.ptr != key.data() + key.size() || id < 0) {
+                err = "logit_bias keys must be non-negative integer token ids";
+                return false;
+            }
+            if (vocab > 0 && id >= vocab) {
+                err = "logit_bias key " + key + " is outside the model's vocabulary";
+                return false;
+            }
+            bias.emplace_back(id, static_cast<float>(b));
+        }
+        out.logit_bias = std::move(bias);
+    }
     return true;
 }
 
@@ -1229,6 +1277,10 @@ bool should_reject_dflash_temperature(bool dflash_env_on, float temperature) {
 
 bool should_reject_dflash_penalty(bool dflash_env_on, float presence_penalty, float frequency_penalty) {
     return dflash_env_on && (presence_penalty != 0.f || frequency_penalty != 0.f);
+}
+
+bool should_reject_dflash_logit_bias(bool dflash_env_on, bool has_logit_bias) {
+    return dflash_env_on && has_logit_bias;
 }
 
 std::string apply_qwen36_tools_template(const ChatRequest& request, bool enable_thinking) {

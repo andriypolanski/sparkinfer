@@ -75,6 +75,11 @@ public:
     // ContinuousBatchEngine::Request's doc comment for the semantics and the "no inertness proof,
     // needs its own DFlash check" distinction from top_k/top_p.
     //
+    // logit_bias: (token_id, bias in [-100,100]) pairs, empty disables it. Same tier as
+    // presence_penalty/frequency_penalty (sampling control, not reporting) -- see
+    // ContinuousBatchEngine::Request's doc comment. Unlike every other sampling control here, its
+    // value is static for the whole request rather than refreshed per decode step.
+    //
     // on_token_logprob (optional) fires once per token, immediately before on_token for that same
     // token, only when logprobs is true AND this callback is non-null -- pass nullptr (not a
     // no-op lambda) when logprobs aren't wanted; see ContinuousBatchEngine::complete_streaming's
@@ -85,6 +90,7 @@ public:
                                         float temperature = 0.f, uint64_t seed = 0,
                                         int top_k = 0, float top_p = 1.0f,
                                         float presence_penalty = 0.f, float frequency_penalty = 0.f,
+                                        const std::vector<std::pair<int, float>>& logit_bias = {},
                                         bool logprobs = false, int top_logprobs = 0,
                                         const std::function<void(const TokenLogprob&)>&
                                             on_token_logprob = nullptr);

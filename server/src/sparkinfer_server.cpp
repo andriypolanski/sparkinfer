@@ -488,7 +488,7 @@ int main(int argc, char** argv) {
                  g_requests_total++;
                  sparkinfer_server::RequestControls controls;
                  std::string err;
-                 if (!sparkinfer_server::parse_request_controls(req.body, controls, err)) {
+                 if (!sparkinfer_server::parse_request_controls(req.body, controls, err, engine.vocab())) {
                      g_requests_client_error++;
                      res.status = 400;
                      res.set_content("{\"error\":{\"message\":\"" + json_escape(err) + "\"}}",
@@ -528,6 +528,19 @@ int main(int argc, char** argv) {
                      res.status = 400;
                      res.set_content("{\"error\":{\"message\":\"presence_penalty/frequency_penalty are not "
                                      "supported while SPARKINFER_DFLASH=1 is active on this server instance\"}}",
+                                     "application/json");
+                     return;
+                 }
+                 // Same "no inertness proof at temperature<=0" gap as presence/frequency penalty
+                 // above -- an arbitrary per-vocab additive bias can change the greedy-argmax
+                 // winner on its own, so this needs its own DFlash check too, independent of both
+                 // checks above.
+                 if (sparkinfer_server::should_reject_dflash_logit_bias(
+                         dflash_env_on, !controls.logit_bias.empty())) {
+                     g_requests_client_error++;
+                     res.status = 400;
+                     res.set_content("{\"error\":{\"message\":\"logit_bias is not supported while "
+                                     "SPARKINFER_DFLASH=1 is active on this server instance\"}}",
                                      "application/json");
                      return;
                  }
@@ -600,6 +613,7 @@ int main(int argc, char** argv) {
                           top_k = controls.top_k, top_p = controls.top_p,
                           presence_penalty = controls.presence_penalty,
                           frequency_penalty = controls.frequency_penalty,
+                          logit_bias = controls.logit_bias,
                           logprobs = controls.logprobs, top_logprobs = controls.top_logprobs]
                          (size_t offset, httplib::DataSink& sink) {
                              if (offset > 0) {
@@ -646,7 +660,7 @@ int main(int argc, char** argv) {
                                          }
                                          return sink.is_writable();
                                      };
-                                     outcome = engine.complete_streaming(cur_prompt_ids, max_tokens, on_tok, temperature, seed, top_k, top_p, presence_penalty, frequency_penalty);
+                                     outcome = engine.complete_streaming(cur_prompt_ids, max_tokens, on_tok, temperature, seed, top_k, top_p, presence_penalty, frequency_penalty, logit_bias);
                                      total_prompt_tokens += (long long)cur_prompt_ids.size();
                                      total_completion_tokens += (long long)ids.size();
                                      if (outcome.cancelled && !stopped_by_sequence) {
@@ -811,7 +825,7 @@ int main(int argc, char** argv) {
                                               : nullptr;
                              const auto outcome = engine.complete_streaming(prompt_ids, max_tokens, on_tok,
                                  temperature, seed, top_k, top_p, presence_penalty, frequency_penalty,
-                                 logprobs, top_logprobs, maybe_on_tok_logprob);
+                                 logit_bias, logprobs, top_logprobs, maybe_on_tok_logprob);
                              const int prompt_tokens = (int)prompt_ids.size();
                              const int completion_tokens = (int)stream_ids.size();
                              g_prompt_tokens_total += (uint64_t)prompt_tokens;
@@ -962,7 +976,7 @@ int main(int argc, char** argv) {
                              }
                              return true;
                          };
-                         outcome = engine.complete_streaming(cur_prompt_ids, max_tokens, on_tok, controls.temperature, controls.seed, controls.top_k, controls.top_p, controls.presence_penalty, controls.frequency_penalty);
+                         outcome = engine.complete_streaming(cur_prompt_ids, max_tokens, on_tok, controls.temperature, controls.seed, controls.top_k, controls.top_p, controls.presence_penalty, controls.frequency_penalty, controls.logit_bias);
                          total_prompt_tokens += (long long)cur_prompt_ids.size();
                          total_completion_tokens += (long long)ids.size();
                          if (!outcome.error.empty()) {
@@ -1050,7 +1064,7 @@ int main(int argc, char** argv) {
                                       : nullptr;
                      outcome = engine.complete_streaming(prompt_ids, max_tokens, nonstream_on_tok,
                          controls.temperature, controls.seed, controls.top_k, controls.top_p,
-                         controls.presence_penalty, controls.frequency_penalty,
+                         controls.presence_penalty, controls.frequency_penalty, controls.logit_bias,
                          controls.logprobs, controls.top_logprobs, maybe_nonstream_on_tok_logprob);
                      // Defensive clamp -- should already hold, cheap insurance against any
                      // subtle off-by-one between the two accumulation paths above.

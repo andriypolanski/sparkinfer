@@ -63,6 +63,10 @@ add_executable(penalty_gpu_test penalty_gpu_test.cpp)
 target_link_libraries(penalty_gpu_test PRIVATE sparkinfer_runtime CUDA::cudart)
 add_test(NAME penalty_gpu_test COMMAND penalty_gpu_test)
 
+add_executable(logit_bias_gpu_test logit_bias_gpu_test.cpp)
+target_link_libraries(logit_bias_gpu_test PRIVATE sparkinfer_runtime CUDA::cudart)
+add_test(NAME logit_bias_gpu_test COMMAND logit_bias_gpu_test)
+
 # Real sidecar subprocess + real KV cache + a small synthetic model on real hardware -- the one
 # place both halves of the LMCache bridge run together against the real model code path. Skips
 # (not fails) unless SPARKINFER_LMCACHE_PYTHON/_BRIDGE_SCRIPT point at a real lmcache+torch venv

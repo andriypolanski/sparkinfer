@@ -9,6 +9,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "sparkinfer/kv_cache.h"
@@ -64,6 +65,17 @@ public:
         // entry than emitted tokens.
         bool logprobs = false;
         int top_logprobs = 0;   // 0-20; only meaningful when logprobs is true
+        // OpenAI's logit_bias: (token_id, bias in [-100,100]) pairs, added to every vocab logit
+        // each decode step -- see Qwen35Model::forward_token's doc comment. Empty (default)
+        // disables it. UNLIKE every other sampling control above, this is NOT refreshed every
+        // forward_token() call -- it's static for the whole request, set once at submit time
+        // (Qwen35Model::set_logit_bias, called from submit_locked() alongside
+        // reset_penalty_counts). Same "no inertness proof at temperature<=0, needs its own DFlash
+        // check" story as presence/frequency penalty (should_reject_dflash_logit_bias). First
+        // non-scalar sampling-control field here -- deep-copied into Job by submit_locked's
+        // `job.req = req;`, same safe-across-the-async-worker-boundary mechanism `prompt` already
+        // relies on.
+        std::vector<std::pair<int, float>> logit_bias;
     };
 
     struct Result {

@@ -213,6 +213,18 @@ public:
     // penalty_counts buffer (see SessionBuffers, activate_session()) across every decode step of
     // the SAME request -- reset once per request at submit time
     // (Qwen35Model::reset_penalty_counts), NOT per forward_token() call.
+    //
+    // logit_bias (OpenAI's [-100, 100] per-token range) adds a fixed per-vocab-id bias to the same
+    // FULL vocab-sized logits row, also before top_k/top_p truncation -- see
+    // kernels::launch_logit_bias. Unlike every other sampling control here, it takes NO parameter
+    // in this function: the bias is STATIC for the whole request (not refreshed every decode step
+    // like temperature/top_k/top_p/the penalties), so it is set ONCE per request, at submit time,
+    // directly into the CURRENT session's per-session logit_bias buffer (see SessionBuffers,
+    // activate_session(), Qwen35Model::set_logit_bias) -- forward_token() just reads whatever is
+    // currently in that buffer, every decode step, unconditionally (same graph-replay-safety
+    // discipline as everything else on this path). Same "no inertness proof at temperature<=0,
+    // needs its own DFlash check" story as presence/frequency penalty -- see
+    // should_reject_dflash_logit_bias in chat_tools.hpp.
     int forward_token(int token_id, int position, bool sample = true, float temperature = 0.f,
                       unsigned long long seed = 0, unsigned long long sample_step = 0,
                       int top_k = 0, float top_p = 1.f,
@@ -316,6 +328,18 @@ public:
     // all-zero counts, or one client's generation would incorrectly penalize a later, unrelated
     // client's request sharing the same prefix session. No-op if seq_id has no session entry.
     void reset_penalty_counts(uint64_t seq_id);
+
+    // Sets seq_id's per-request logit_bias buffer: zeros it, then scatters the given sparse
+    // (token_id, bias) pairs into it (each bias applied via kernels::launch_logit_bias every decode
+    // step of this request, see forward_token's doc comment above). MUST be called once per REQUEST
+    // that will use this seq_id, same "even for a freshly open_session()'d id" and "critically
+    // needed for seq_id == 0" reasoning as reset_penalty_counts -- call it right alongside that
+    // function at every call site (see ContinuousBatchEngine::submit_locked). An empty `bias` still
+    // zeros the buffer (clears any prior request's bias when seq_id == 0 is reused) and returns.
+    // token ids are NOT re-validated against vocab here (parse_request_controls already did that,
+    // with the real vocab size in scope) -- the scatter kernel keeps a defensive bound check as a
+    // backstop only. No-op if seq_id has no session entry.
+    void set_logit_bias(uint64_t seq_id, const std::vector<std::pair<int, float>>& bias);
 
     // Token budget for KV allocation: prompt + decode headroom, capped at max_seq.
     static int session_token_budget(size_t prompt_len, int max_new, int max_seq);

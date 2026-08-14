@@ -23,6 +23,7 @@ using sparkinfer_server::apply_qwen36_tools_template;
 using sparkinfer_server::parse_chat_request_json;
 using sparkinfer_server::parse_qwen36_tool_output;
 using sparkinfer_server::parse_request_controls;
+using sparkinfer_server::should_reject_dflash_logit_bias;
 using sparkinfer_server::should_reject_dflash_penalty;
 using sparkinfer_server::should_reject_dflash_temperature;
 using sparkinfer_server::validate_response_format;
@@ -1091,6 +1092,65 @@ bool test_should_reject_dflash_penalty() {
     return true;
 }
 
+bool test_request_controls_logit_bias_validation() {
+    RequestControls controls;
+    std::string err;
+    CHECK(parse_request_controls(R"({})", controls, err));
+    CHECK(controls.logit_bias.empty());
+
+    CHECK(parse_request_controls(R"({"logit_bias":{"1234":-100,"5678":5.5}})", controls, err));
+    CHECK(controls.logit_bias.size() == 2);
+    auto find = [&](int id) -> const float* {
+        for (const auto& p : controls.logit_bias) if (p.first == id) return &p.second;
+        return nullptr;
+    };
+    CHECK(find(1234) && *find(1234) == -100.f);
+    CHECK(find(5678) && *find(5678) > 5.49f && *find(5678) < 5.51f);
+
+    // Boundary values accepted, one past the boundary rejected.
+    CHECK(parse_request_controls(R"({"logit_bias":{"0":-100,"1":100}})", controls, err));
+    CHECK(!parse_request_controls(R"({"logit_bias":{"0":-100.1}})", controls, err));
+    CHECK(!parse_request_controls(R"({"logit_bias":{"0":100.1}})", controls, err));
+    CHECK(!parse_request_controls(R"({"logit_bias":{"0":"high"}})", controls, err));
+
+    // Not an object.
+    CHECK(!parse_request_controls(R"({"logit_bias":[1,2,3]})", controls, err));
+    CHECK(!parse_request_controls(R"({"logit_bias":"nope"})", controls, err));
+
+    // Malformed / non-integer / negative keys, all rejected.
+    CHECK(!parse_request_controls(R"({"logit_bias":{"12a":1}})", controls, err));
+    CHECK(!parse_request_controls(R"({"logit_bias":{"1.5":1}})", controls, err));
+    CHECK(!parse_request_controls(R"({"logit_bias":{"":1}})", controls, err));
+    CHECK(!parse_request_controls(R"({"logit_bias":{" 12":1}})", controls, err));
+    CHECK(!parse_request_controls(R"({"logit_bias":{"-1":1}})", controls, err));
+
+    // Entry-count cap.
+    {
+        std::string body = "{\"logit_bias\":{";
+        for (int i = 0; i < 1025; i++) body += (i ? "," : "") + std::string("\"") + std::to_string(i) + "\":1";
+        body += "}}";
+        CHECK(!parse_request_controls(body, controls, err));
+    }
+
+    // vocab == 0 (default): upper bound not checked -- an absurdly large id is still accepted.
+    CHECK(parse_request_controls(R"({"logit_bias":{"999999999":1}})", controls, err));
+    // With an explicit vocab: in-range accepted, >= vocab rejected.
+    CHECK(parse_request_controls(R"({"logit_bias":{"151935":1}})", controls, err, /*vocab=*/151936));
+    CHECK(!parse_request_controls(R"({"logit_bias":{"151936":1}})", controls, err, /*vocab=*/151936));
+
+    // Does not require temperature to be set.
+    CHECK(parse_request_controls(R"({"logit_bias":{"0":1}})", controls, err));
+    CHECK(controls.temperature == 0.f);
+    return true;
+}
+
+bool test_should_reject_dflash_logit_bias() {
+    CHECK(!should_reject_dflash_logit_bias(/*dflash_env_on=*/false, /*has_logit_bias=*/true));
+    CHECK(!should_reject_dflash_logit_bias(/*dflash_env_on=*/true, /*has_logit_bias=*/false));
+    CHECK(should_reject_dflash_logit_bias(/*dflash_env_on=*/true, /*has_logit_bias=*/true));
+    return true;
+}
+
 bool test_plain_answer() {
     ChatRequest request;
     CHECK(parse_request(hermes_request(), request));
@@ -1313,6 +1373,8 @@ int main() {
     if (!test_request_controls_frequency_penalty_validation()) return 1;
     if (!test_should_reject_dflash_temperature()) return 1;
     if (!test_should_reject_dflash_penalty()) return 1;
+    if (!test_request_controls_logit_bias_validation()) return 1;
+    if (!test_should_reject_dflash_logit_bias()) return 1;
     if (!test_malformed_and_unknown_calls()) return 1;
     if (!test_invalid_requests_and_duplicate_tools()) return 1;
     if (!test_unsafe_protocol_names()) return 1;

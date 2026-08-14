@@ -172,11 +172,13 @@ uint64_t ContinuousBatchEngine::submit_locked(Job job, const std::function<bool(
         if (!kv_->allocate(seq_id, budget)) return fail(EnqueueError::OVERLOADED);
         model_->activate_session(seq_id);
         model_->reset_penalty_counts(seq_id);   // session 0 is shared across unrelated requests
+        model_->set_logit_bias(seq_id, job.req.logit_bias);   // same reason
     } else {
         bool alloc_failed = false;
         seq_id = model_->open_session(budget, &alloc_failed);
         if (!seq_id) return fail(alloc_failed ? EnqueueError::ALLOC_FAILED : EnqueueError::OVERLOADED);
         model_->reset_penalty_counts(seq_id);   // explicit, not relying on open_session's internal zero
+        model_->set_logit_bias(seq_id, job.req.logit_bias);    // same reason
     }
 
     job.request_id = next_req_id_.fetch_add(1);
